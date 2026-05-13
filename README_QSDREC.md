@@ -219,3 +219,51 @@ loss变化图
 python scripts\plot_history.py `
     --history runs\office\sasrec\history.json `
     --output runs\office\sasrec\history_curve.png
+
+## 7. 实验结果汇总与最优参数选择
+
+训练完成后，每个实验目录下都会生成 `test_metrics.json`，其中包含：
+
+- `test`：最终测试集指标，包括 `HR@5/10/20`、`Recall@5/10/20`、`NDCG@5/10/20`。
+- `best_valid_NDCG@10`：验证集上用于选择最优模型的指标。
+- `args`：本次实验的完整参数配置，便于后续复现实验。
+
+可以使用汇总脚本递归读取所有实验结果，并按照指定指标排序：
+
+```powershell
+python scripts\summarize_experiments.py `
+  --root runs\office `
+  --metric NDCG@10 `
+  --top-k 20
+```
+
+如果需要导出 CSV 表格：
+
+```powershell
+python scripts\summarize_experiments.py `
+  --root runs\office `
+  --metric NDCG@10 `
+  --top-k 20 `
+  --csv runs\office\experiment_summary.csv
+```
+
+如果服务器上的结果输出到新目录，例如 `runs/office_5090`：
+
+```powershell
+python scripts\summarize_experiments.py `
+  --root runs\office_5090 `
+  --metric NDCG@10 `
+  --top-k 20 `
+  --csv runs\office_5090\experiment_summary.csv
+```
+
+也可以按照其他指标排序，例如：
+
+```powershell
+python scripts\summarize_experiments.py `
+  --root runs\office `
+  --metric HR@10 `
+  --top-k 20
+```
+
+论文主结果建议优先按照 `NDCG@10` 选择最优参数，同时检查 `HR@10` 和 `NDCG@20` 是否也同步提升。

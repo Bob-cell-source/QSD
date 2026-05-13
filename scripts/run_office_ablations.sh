@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="D:/Users/111/anaconda3/envs/sensevoice/python.exe"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 DATASET_DIR="${DATASET_DIR:-runs/office}"
 SEMANTIC_IDS="${SEMANTIC_IDS:-runs/office/semantic_ids_rq.json}"
 BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-runs/office}"
@@ -9,7 +9,7 @@ DEVICE="${DEVICE:-cuda}"
 
 EPOCHS="${EPOCHS:-100}"
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-10}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-1024}"
 MAX_LEN="${MAX_LEN:-50}"
 DIM="${DIM:-128}"
 NUM_RANDOM_NEG="${NUM_RANDOM_NEG:-100}"
