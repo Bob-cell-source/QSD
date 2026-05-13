@@ -79,7 +79,7 @@ D:\Users\111\anaconda3\envs\sensevoice\python.exe scripts\build_semantic_ids.py 
   --encoder-model BAAI/bge-small-en-v1.5 `
   --codebook-sizes 64,128,256,512 `
   --batch-size 64 `
-  --max-length 256 `
+  --max-length 512 `
   --save-embeddings runs\office\item_text_embeddings.npy `
   --save-item-ids runs\office\embedding_item_ids.json
 ```
@@ -144,7 +144,41 @@ D:\Users\111\anaconda3\envs\sensevoice\python.exe scripts\train_qsdrec.py `
   --num-hard-neg 20 `
   --num-random-neg 100
 ```
-
+scripts\train_qsdrec.py `
+  --dataset-dir runs\office `
+  --semantic-ids runs\office\semantic_ids_rq.json `
+  --output-dir runs\office\qsdrec `
+  --device cuda `
+  --epochs 30 `
+  --batch-size 256 `
+  --max-len 20 `
+  --dim 64 `
+  --num-interests 3 `
+  --prefix-level 2 `
+  --num-hard-neg 10 `
+  --num-random-neg 50 `
+  --weight-decay 1e-5 `
+  --dis-weight 0.1 `
+  --sem-weight 0.3 `
+  --div-weight 1e-3
+纯ID版本
+scripts\train_qsdrec.py `
+  --dataset-dir runs\office `
+  --semantic-ids runs\office\semantic_ids_rq.json `
+  --output-dir runs\office\sasrec `
+  --device cuda `
+  --epochs 30 `
+  --batch-size 256 `
+  --max-len 20 `
+  --dim 64 `
+  --num-interests 1 `
+  --prefix-level 2 `
+  --num-hard-neg 0 `
+  --num-random-neg 100 `
+  --weight-decay 1e-5 `
+  --dis-weight 0 `
+  --sem-weight 0 `
+  --div-weight 1e-3
 主要输出：
 
 - `best.pt`：验证集最优模型。
@@ -180,3 +214,8 @@ s(u,i)=s_{id}(u,i)+\lambda s_{sem}(u,i)
 - \(s_{id}\)：SASRec 协同记忆分支。
 - \(s_{sem}\)：多兴趣 query 与 semantic ID token 的语义消歧分支。
 - Prefix hard negatives：从共享语义前缀的 sibling items 中采样。
+
+loss变化图
+python scripts\plot_history.py `
+    --history runs\office\sasrec\history.json `
+    --output runs\office\sasrec\history_curve.png

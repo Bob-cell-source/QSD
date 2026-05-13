@@ -89,20 +89,9 @@ def collate_train(batch, sampler: CandidateSampler):
     return seq_tensor, torch.tensor(cand, dtype=torch.long)
 
 
-def collate_eval(batch, sampler: CandidateSampler, num_eval_neg: int):
+def collate_full_eval(batch):
     seqs, targets = zip(*batch)
-    seq_tensor = torch.stack(seqs)
-    cand = []
-    for seq, target in zip(seqs, targets):
-        seen = {int(x) for x in seq.tolist() if int(x) > 0}
-        old_random = sampler.num_random_neg
-        old_hard = sampler.num_hard_neg
-        sampler.num_random_neg = num_eval_neg
-        sampler.num_hard_neg = 0
-        cand.append(sampler.sample_one(int(target), seen))
-        sampler.num_random_neg = old_random
-        sampler.num_hard_neg = old_hard
-    return seq_tensor, torch.tensor(cand, dtype=torch.long)
+    return torch.stack(seqs), torch.tensor(targets, dtype=torch.long)
 
 
 def build_semantic_table(
@@ -130,32 +119,66 @@ def cross_entropy_first_positive(scores: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def evaluate(
+def evaluate_full_ranking(
     model: QSDRec,
     loader: DataLoader,
     device: torch.device,
+    num_items: int,
     sem_weight: float,
-    ks: Sequence[int] = (5, 10),
+    ks: Sequence[int] = (5, 10, 20),
+    batch_eval_size: int = 1024,
 ) -> Dict[str, float]:
     model.eval()
     hits = {k: 0.0 for k in ks}
     ndcgs = {k: 0.0 for k in ks}
     total = 0
-    for seq, candidates in loader:
+
+    all_items = torch.arange(1, num_items + 1, dtype=torch.long, device=device)
+    max_k = max(ks)
+
+    for seq, targets in loader:
         seq = seq.to(device)
-        candidates = candidates.to(device)
-        scores = model(seq, candidates, sem_weight=sem_weight)["score"]
-        ranks = scores.argsort(dim=1, descending=True)
-        pos_rank = (ranks == 0).nonzero(as_tuple=False)[:, 1] + 1
+        targets = targets.to(device)
+        batch_size = seq.size(0)
+
+        score_chunks = []
+        for start in range(0, num_items, batch_eval_size):
+            cand = all_items[start : start + batch_eval_size]
+            cand = cand.unsqueeze(0).expand(batch_size, -1)
+            out = model(seq, cand, sem_weight=sem_weight)
+            score_chunks.append(out["score"])
+        scores = torch.cat(score_chunks, dim=1)
+
+        # Exclude historical interactions so evaluation follows leave-one-out
+        # full ranking instead of rewarding already-consumed items.
+        seen_mask = seq.gt(0)
+        if seen_mask.any():
+            history_rows, history_cols = seen_mask.nonzero(as_tuple=True)
+            history_item_idx = seq[history_rows, history_cols] - 1
+            scores[history_rows, history_item_idx] = float("-inf")
+
+        topk_idx = scores.topk(k=max_k, dim=1).indices + 1
+        target_col = targets.unsqueeze(1)
+
         for k in ks:
-            ok = pos_rank <= k
-            hits[k] += ok.float().sum().item()
-            ndcgs[k] += (ok.float() / torch.log2(pos_rank.float() + 1.0)).sum().item()
-        total += seq.size(0)
+            topk = topk_idx[:, :k]
+            match = topk.eq(target_col)
+            hit = match.any(dim=1)
+            hits[k] += hit.float().sum().item()
+
+            pos = match.float().argmax(dim=1) + 1
+            ndcg = hit.float() / torch.log2(pos.float() + 1.0)
+            ndcgs[k] += ndcg.sum().item()
+
+        total += batch_size
+
     result = {}
     for k in ks:
-        result[f"Recall@{k}"] = hits[k] / max(total, 1)
-        result[f"NDCG@{k}"] = ndcgs[k] / max(total, 1)
+        hr = hits[k] / max(total, 1)
+        ndcg = ndcgs[k] / max(total, 1)
+        result[f"HR@{k}"] = hr
+        result[f"Recall@{k}"] = hr
+        result[f"NDCG@{k}"] = ndcg
     return result
 
 
@@ -193,14 +216,14 @@ def train(args) -> None:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
-        collate_fn=lambda b: collate_eval(b, sampler, args.num_eval_neg),
+        collate_fn=collate_full_eval,
     )
     test_loader = DataLoader(
         test_data,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
-        collate_fn=lambda b: collate_eval(b, sampler, args.num_eval_neg),
+        collate_fn=collate_full_eval,
     )
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
@@ -220,6 +243,7 @@ def train(args) -> None:
     best_metric = -1.0
     best_path = output_dir / "best.pt"
     history = []
+    bad_epochs = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
@@ -238,22 +262,56 @@ def train(args) -> None:
             opt.step()
             total_loss += loss.item()
             steps += 1
-        valid = evaluate(model, valid_loader, device, args.sem_weight)
+        valid = evaluate_full_ranking(
+            model=model,
+            loader=valid_loader,
+            device=device,
+            num_items=num_items,
+            sem_weight=args.sem_weight,
+            ks=(5, 10, 20),
+            batch_eval_size=args.eval_batch_eval_size,
+        )
         row = {"epoch": epoch, "loss": total_loss / max(steps, 1), **valid}
         history.append(row)
         print(row)
         metric = valid.get("NDCG@10", 0.0)
         if metric > best_metric:
             best_metric = metric
+            bad_epochs = 0
             torch.save({"model": model.state_dict(), "args": vars(args)}, best_path)
+        else:
+            bad_epochs += 1
+            if bad_epochs >= args.early_stop_patience:
+                print(
+                    {
+                        "early_stop": True,
+                        "epoch": epoch,
+                        "best_valid_NDCG@10": best_metric,
+                        "patience": args.early_stop_patience,
+                    }
+                )
+                break
 
     if best_path.exists():
         state = torch.load(best_path, map_location=device)
         model.load_state_dict(state["model"])
-    test = evaluate(model, test_loader, device, args.sem_weight)
+    test = evaluate_full_ranking(
+        model=model,
+        loader=test_loader,
+        device=device,
+        num_items=num_items,
+        sem_weight=args.sem_weight,
+        ks=(5, 10, 20),
+        batch_eval_size=args.eval_batch_eval_size,
+    )
+    result = {
+        "test": test,
+        "best_valid_NDCG@10": best_metric,
+        "args": vars(args),
+    }
     write_json(output_dir / "history.json", history)
-    write_json(output_dir / "test_metrics.json", test)
-    print({"test": test, "best_valid_NDCG@10": best_metric})
+    write_json(output_dir / "test_metrics.json", result)
+    print(result)
 
 
 def main() -> None:
@@ -274,7 +332,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-random-neg", type=int, default=100)
     parser.add_argument("--num-hard-neg", type=int, default=20)
-    parser.add_argument("--num-eval-neg", type=int, default=100)
+    parser.add_argument("--eval-batch-eval-size", type=int, default=1024)
+    parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--prefix-level", type=int, default=2)
     parser.add_argument("--sem-weight", type=float, default=1.0)
     parser.add_argument("--dis-weight", type=float, default=0.2)

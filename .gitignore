@@ -124,7 +124,7 @@ mlruns/
 lightning_logs/
 tensorboard/
 tb_logs/
-
+test/
 *.ckpt
 *.pt
 *.pth

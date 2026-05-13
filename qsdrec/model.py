@@ -5,6 +5,25 @@ import torch
 from torch import nn
 
 
+class PointWiseFeedForward(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv1d(dim, dim, kernel_size=1)
+        self.dropout1 = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv1d(dim, dim, kernel_size=1)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = x.transpose(-1, -2)
+        y = self.conv1(y)
+        y = self.dropout1(y)
+        y = self.relu(y)
+        y = self.conv2(y)
+        y = self.dropout2(y)
+        return y.transpose(-1, -2)
+
+
 class SASRecEncoder(nn.Module):
     def __init__(
         self,
@@ -17,32 +36,56 @@ class SASRecEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.item_emb = nn.Embedding(num_items + 1, dim, padding_idx=0)
-        self.pos_emb = nn.Embedding(max_len, dim)
-        layer = nn.TransformerEncoderLayer(
-            d_model=dim,
-            nhead=num_heads,
-            dim_feedforward=dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.pos_emb = nn.Embedding(max_len + 1, dim, padding_idx=0)
         self.dropout = nn.Dropout(dropout)
         self.max_len = max_len
-        self.norm = nn.LayerNorm(dim)
+        self.dim = dim
+        self.attention_layernorms = nn.ModuleList()
+        self.attention_layers = nn.ModuleList()
+        self.forward_layernorms = nn.ModuleList()
+        self.forward_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.attention_layernorms.append(nn.LayerNorm(dim, eps=1e-8))
+            self.attention_layers.append(
+                nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=False)
+            )
+            self.forward_layernorms.append(nn.LayerNorm(dim, eps=1e-8))
+            self.forward_layers.append(PointWiseFeedForward(dim, dropout))
+        self.norm = nn.LayerNorm(dim, eps=1e-8)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for param in self.parameters():
+            if param.dim() > 1:
+                nn.init.xavier_normal_(param)
+        with torch.no_grad():
+            self.item_emb.weight[0].fill_(0)
+            self.pos_emb.weight[0].fill_(0)
 
     def forward(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch, length = seq.shape
-        pos = torch.arange(length, device=seq.device).unsqueeze(0).expand(batch, -1)
-        x = self.item_emb(seq) + self.pos_emb(pos)
+        pos = torch.arange(1, length + 1, device=seq.device).unsqueeze(0).expand(batch, -1)
+        pos = pos * seq.ne(0).long()
+        x = self.item_emb(seq) * math.sqrt(self.dim)
+        x = x + self.pos_emb(pos)
         x = self.dropout(x)
         causal_mask = torch.triu(
             torch.ones(length, length, dtype=torch.bool, device=seq.device),
             diagonal=1,
         )
-        pad_mask = seq.eq(0)
-        h = self.encoder(x, mask=causal_mask, src_key_padding_mask=pad_mask)
+        h = x
+        for attn_norm, attn, ffn_norm, ffn in zip(
+            self.attention_layernorms,
+            self.attention_layers,
+            self.forward_layernorms,
+            self.forward_layers,
+        ):
+            h_t = h.transpose(0, 1)
+            q = attn_norm(h_t)
+            attn_out, _ = attn(q, q, q, attn_mask=causal_mask)
+            h = (h_t + attn_out).transpose(0, 1)
+            h = h + ffn(ffn_norm(h))
+            h = h * seq.ne(0).unsqueeze(-1)
         h = self.norm(h)
         # Sequences are left padded, so the newest non-padding item is at the
         # final position for every non-empty training/eval sample.
