@@ -65,7 +65,7 @@ D:\Users\111\anaconda3\envs\sensevoice\python.exe scripts\build_semantic_ids.py 
   --encoder-model BAAI/bge-small-en-v1.5 `
   --codebook-sizes 64,128,256,512 `
   --batch-size 64 `
-  --max-length 256 `
+  --max-length 512 `
   --save-embeddings runs\beauty\item_text_embeddings.npy `
   --save-item-ids runs\beauty\embedding_item_ids.json
 ```
@@ -250,11 +250,7 @@ python scripts\summarize_experiments.py `
 如果服务器上的结果输出到新目录，例如 `runs/office_5090`：
 
 ```powershell
-python scripts\summarize_experiments.py `
-  --root runs\office_5090 `
-  --metric NDCG@10 `
-  --top-k 20 `
-  --csv runs\office_5090\experiment_summary.csv
+python scripts/summarize_experiments.py --root runs/office_5090 --metric NDCG@10 --top-k 20 --csv runs/office_5090/experiment_summary.csv
 ```
 
 也可以按照其他指标排序，例如：

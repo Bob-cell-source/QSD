@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Tuple
+from typing import Dict, Literal, Tuple
 
 import torch
 from torch import nn
@@ -105,8 +105,12 @@ class QSDRec(nn.Module):
         num_heads: int = 2,
         num_layers: int = 2,
         dropout: float = 0.2,
+        interest_router: Literal["semantic", "prefix"] = "semantic",
+        prefix_level: int = 2,
     ) -> None:
         super().__init__()
+        if interest_router not in {"semantic", "prefix"}:
+            raise ValueError(f"Unsupported interest_router: {interest_router}")
         self.encoder = SASRecEncoder(num_items, dim, max_len, num_heads, num_layers, dropout)
         self.register_buffer("semantic_id_table", semantic_id_table.long())
         self.semantic_emb = nn.Embedding(num_semantic_tokens + 1, dim, padding_idx=0)
@@ -120,8 +124,17 @@ class QSDRec(nn.Module):
             nn.Linear(dim, 1),
         )
         self.sem_proj = nn.Linear(dim, dim)
+        self.prefix_router = nn.Sequential(
+            nn.Linear(dim * 3, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, 1),
+        )
+        self.prefix_proj = nn.Linear(dim, dim)
         self.num_interests = num_interests
         self.dim = dim
+        self.interest_router = interest_router
+        self.prefix_level = prefix_level
 
     def sequence_semantic_memory(self, seq: torch.Tensor) -> torch.Tensor:
         sid = self.semantic_id_table[seq]  # [B, L, F]
@@ -152,8 +165,17 @@ class QSDRec(nn.Module):
         attn = torch.softmax(attn_logits, dim=-1)
         resp = torch.einsum("bckf,bcfd->bckd", attn, tok)
         q_exp = q.expand(-1, candidates.size(1), -1, -1)
-        beta_in = torch.cat([q_exp, resp, q_exp * resp], dim=-1)
-        beta = torch.softmax(self.beta(beta_in).squeeze(-1), dim=-1)
+        if self.interest_router == "prefix":
+            prefix_sid = sid[:, :, : self.prefix_level]
+            prefix_tok = self.semantic_emb(prefix_sid)
+            prefix_mask = prefix_sid.ne(0).float().unsqueeze(-1)
+            prefix = (prefix_tok * prefix_mask).sum(dim=2) / prefix_mask.sum(dim=2).clamp_min(1.0)
+            prefix = self.prefix_proj(prefix).unsqueeze(2).expand(-1, -1, queries.size(1), -1)
+            beta_in = torch.cat([q_exp, prefix, q_exp * prefix], dim=-1)
+            beta = torch.softmax(self.prefix_router(beta_in).squeeze(-1), dim=-1)
+        else:
+            beta_in = torch.cat([q_exp, resp, q_exp * resp], dim=-1)
+            beta = torch.softmax(self.beta(beta_in).squeeze(-1), dim=-1)
         dots = (q_exp * resp).sum(dim=-1)
         return (beta * dots).sum(dim=-1)
 

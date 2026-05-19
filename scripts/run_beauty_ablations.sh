@@ -2,14 +2,15 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-DATASET_DIR="${DATASET_DIR:-runs/office}"
-SEMANTIC_IDS="${SEMANTIC_IDS:-runs/office/semantic_ids_rq.json}"
-BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-runs/office}"
+DATASET_DIR="${DATASET_DIR:-runs/beauty}"
+SEMANTIC_IDS="${SEMANTIC_IDS:-runs/beauty/semantic_ids_rq.json}"
+BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-runs/beauty}"
 DEVICE="${DEVICE:-cuda}"
 
 EPOCHS="${EPOCHS:-100}"
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-10}"
-BATCH_SIZE="${BATCH_SIZE:-1024}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
+EVAL_BATCH_EVAL_SIZE="${EVAL_BATCH_EVAL_SIZE:-1024}"
 MAX_LEN="${MAX_LEN:-50}"
 DIM="${DIM:-128}"
 NUM_RANDOM_NEG="${NUM_RANDOM_NEG:-100}"
@@ -45,6 +46,7 @@ run_exp() {
     --epochs "${EPOCHS}" \
     --early-stop-patience "${EARLY_STOP_PATIENCE}" \
     --batch-size "${BATCH_SIZE}" \
+    --eval-batch-eval-size "${EVAL_BATCH_EVAL_SIZE}" \
     --max-len "${MAX_LEN}" \
     --dim "${DIM}" \
     --num-random-neg "${NUM_RANDOM_NEG}" \

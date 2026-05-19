@@ -1,7 +1,7 @@
 import argparse
 import math
 import random
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -46,6 +46,8 @@ class CandidateSampler:
         num_items: int,
         item_semantic_ids: Dict[int, List[int]],
         prefix_level: int,
+        hard_neg_mode: str,
+        min_overlap_slots: int,
         num_random_neg: int,
         num_hard_neg: int,
     ) -> None:
@@ -53,24 +55,45 @@ class CandidateSampler:
         self.num_random_neg = num_random_neg
         self.num_hard_neg = num_hard_neg
         self.prefix_level = prefix_level
+        self.hard_neg_mode = hard_neg_mode
+        self.min_overlap_slots = min_overlap_slots
         self.prefix_groups: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
+        self.slot_groups: Dict[Tuple[int, int], List[int]] = defaultdict(list)
         for item, sid in item_semantic_ids.items():
             key = tuple(sid[:prefix_level])
             self.prefix_groups[key].append(item)
+            for slot, code in enumerate(sid):
+                self.slot_groups[(slot, int(code))].append(item)
         self.item_semantic_ids = item_semantic_ids
         self.all_items = list(range(1, num_items + 1))
+
+    def hard_pool(self, target: int, seen: set[int], used: set[int]) -> List[int]:
+        sid = self.item_semantic_ids.get(target)
+        if sid is None or self.num_hard_neg <= 0:
+            return []
+        if self.hard_neg_mode == "prefix":
+            group = self.prefix_groups.get(tuple(sid[: self.prefix_level]), [])
+            return [x for x in group if x not in used and x not in seen]
+        if self.hard_neg_mode == "overlap":
+            counts: Counter[int] = Counter()
+            for slot, code in enumerate(sid):
+                counts.update(self.slot_groups.get((slot, int(code)), []))
+            return [
+                item
+                for item, count in counts.items()
+                if count >= self.min_overlap_slots and item not in used and item not in seen
+            ]
+        raise ValueError(f"Unsupported hard_neg_mode: {self.hard_neg_mode}")
 
     def sample_one(self, target: int, seen: set[int] | None = None) -> List[int]:
         seen = seen or set()
         candidates = [target]
         used = {target}
-        sid = self.item_semantic_ids.get(target)
-        if sid is not None and self.num_hard_neg > 0:
-            group = self.prefix_groups.get(tuple(sid[: self.prefix_level]), [])
-            hard_pool = [x for x in group if x not in used and x not in seen]
-            if hard_pool:
-                candidates.extend(random.sample(hard_pool, min(self.num_hard_neg, len(hard_pool))))
-                used.update(candidates)
+        hard_pool = self.hard_pool(target, seen, used)
+        if hard_pool:
+            hard_negs = random.sample(hard_pool, min(self.num_hard_neg, len(hard_pool)))
+            candidates.extend(hard_negs)
+            used.update(hard_negs)
         while len(candidates) < 1 + self.num_hard_neg + self.num_random_neg:
             neg = random.randint(1, self.num_items)
             if neg not in used and neg not in seen:
@@ -115,6 +138,33 @@ def build_semantic_table(
 
 def cross_entropy_first_positive(scores: torch.Tensor) -> torch.Tensor:
     labels = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
+    return torch.nn.functional.cross_entropy(scores, labels)
+
+
+def full_softmax_loss(
+    model: QSDRec,
+    seq: torch.Tensor,
+    targets: torch.Tensor,
+    num_items: int,
+    sem_weight: float,
+    candidate_chunk_size: int,
+) -> torch.Tensor:
+    batch_size = seq.size(0)
+    all_items = torch.arange(1, num_items + 1, dtype=torch.long, device=seq.device)
+    score_chunks = []
+    for start in range(0, num_items, candidate_chunk_size):
+        cand = all_items[start : start + candidate_chunk_size]
+        cand = cand.unsqueeze(0).expand(batch_size, -1)
+        score_chunks.append(model(seq, cand, sem_weight=sem_weight)["score"])
+    scores = torch.cat(score_chunks, dim=1)
+
+    seen_mask = seq.gt(0)
+    if seen_mask.any():
+        history_rows, history_cols = seen_mask.nonzero(as_tuple=True)
+        history_item_idx = seq[history_rows, history_cols] - 1
+        scores[history_rows, history_item_idx] = float("-inf")
+
+    labels = targets - 1
     return torch.nn.functional.cross_entropy(scores, labels)
 
 
@@ -201,6 +251,8 @@ def train(args) -> None:
         num_items,
         item_semantic_ids,
         args.prefix_level,
+        args.hard_neg_mode,
+        args.min_overlap_slots,
         args.num_random_neg,
         args.num_hard_neg,
     )
@@ -237,6 +289,8 @@ def train(args) -> None:
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        interest_router=args.interest_router,
+        prefix_level=args.prefix_level,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -250,12 +304,27 @@ def train(args) -> None:
         steps = 0
         for seq, candidates in train_loader:
             seq = seq.to(device)
-            candidates = candidates.to(device)
-            out = model(seq, candidates, sem_weight=args.sem_weight)
-            rec_loss = cross_entropy_first_positive(out["score"])
-            dis_loss = cross_entropy_first_positive(out["sem_score"])
-            div_loss = model.diversity_loss(out["queries"])
-            loss = rec_loss + args.dis_weight * dis_loss + args.div_weight * div_loss
+            if args.train_objective == "full_softmax":
+                targets = candidates[:, 0].to(device)
+                loss = full_softmax_loss(
+                    model=model,
+                    seq=seq,
+                    targets=targets,
+                    num_items=num_items,
+                    sem_weight=args.sem_weight,
+                    candidate_chunk_size=args.train_candidate_chunk_size,
+                )
+                if args.div_weight > 0:
+                    h_id, _ = model.encoder(seq)
+                    queries = model.user_queries(seq, h_id)
+                    loss = loss + args.div_weight * model.diversity_loss(queries)
+            else:
+                candidates = candidates.to(device)
+                out = model(seq, candidates, sem_weight=args.sem_weight)
+                rec_loss = cross_entropy_first_positive(out["score"])
+                dis_loss = cross_entropy_first_positive(out["sem_score"])
+                div_loss = model.diversity_loss(out["queries"])
+                loss = rec_loss + args.dis_weight * dis_loss + args.div_weight * div_loss
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -325,6 +394,7 @@ def main() -> None:
     parser.add_argument("--max-len", type=int, default=50)
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--num-interests", type=int, default=4)
+    parser.add_argument("--interest-router", choices=["semantic", "prefix"], default="semantic")
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)
@@ -332,6 +402,10 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-random-neg", type=int, default=100)
     parser.add_argument("--num-hard-neg", type=int, default=20)
+    parser.add_argument("--hard-neg-mode", choices=["prefix", "overlap"], default="prefix")
+    parser.add_argument("--min-overlap-slots", type=int, default=2)
+    parser.add_argument("--train-objective", choices=["sampled", "full_softmax"], default="sampled")
+    parser.add_argument("--train-candidate-chunk-size", type=int, default=4096)
     parser.add_argument("--eval-batch-eval-size", type=int, default=1024)
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--prefix-level", type=int, default=2)
