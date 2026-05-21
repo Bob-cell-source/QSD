@@ -136,6 +136,22 @@ def build_semantic_table(
     return table, offset_sem_ids, sum(sizes)
 
 
+def build_semantic_hubness(semantic_table: torch.Tensor, num_semantic_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    token_counts = torch.zeros(num_semantic_tokens + 1, dtype=torch.float)
+    item_sids = semantic_table[1:]
+    valid = item_sids.gt(0)
+    token_counts.scatter_add_(0, item_sids[valid], torch.ones_like(item_sids[valid], dtype=torch.float))
+    token_hub = torch.log1p(token_counts)
+    if token_hub.max() > 0:
+        token_hub = token_hub / token_hub.max()
+    item_hub = token_hub[semantic_table].sum(dim=1)
+    if item_hub.max() > 0:
+        item_hub = item_hub / item_hub.max()
+    item_hub[0] = 0.0
+    token_hub[0] = 0.0
+    return token_hub, item_hub
+
+
 def cross_entropy_first_positive(scores: torch.Tensor) -> torch.Tensor:
     labels = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
     return torch.nn.functional.cross_entropy(scores, labels)
@@ -243,6 +259,7 @@ def train(args) -> None:
     semantic_obj = read_json(args.semantic_ids)
     num_items = int(stats["num_items"])
     semantic_table, item_semantic_ids, num_semantic_tokens = build_semantic_table(semantic_obj, num_items)
+    semantic_token_hubness, semantic_item_hubness = build_semantic_hubness(semantic_table, num_semantic_tokens)
 
     train_data = NextItemDataset(sequences, args.max_len, "train")
     valid_data = NextItemDataset(sequences, args.max_len, "valid")
@@ -291,6 +308,13 @@ def train(args) -> None:
         dropout=args.dropout,
         interest_router=args.interest_router,
         prefix_level=args.prefix_level,
+        semantic_token_hubness=semantic_token_hubness,
+        semantic_item_hubness=semantic_item_hubness,
+        hub_score_weight=args.hub_score_weight,
+        hub_attn_weight=args.hub_attn_weight,
+        evidence_gate=args.evidence_gate,
+        evidence_floor=args.evidence_floor,
+        contrastive_alpha=args.contrastive_alpha,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -324,7 +348,12 @@ def train(args) -> None:
                 rec_loss = cross_entropy_first_positive(out["score"])
                 dis_loss = cross_entropy_first_positive(out["sem_score"])
                 div_loss = model.diversity_loss(out["queries"])
-                loss = rec_loss + args.dis_weight * dis_loss + args.div_weight * div_loss
+                loss = (
+                    rec_loss
+                    + args.dis_weight * dis_loss
+                    + args.div_weight * div_loss
+                    + args.hub_loss_weight * out["hub_loss"]
+                )
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -395,6 +424,12 @@ def main() -> None:
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--num-interests", type=int, default=4)
     parser.add_argument("--interest-router", choices=["semantic", "prefix"], default="semantic")
+    parser.add_argument("--hub-score-weight", type=float, default=0.0)
+    parser.add_argument("--hub-attn-weight", type=float, default=0.0)
+    parser.add_argument("--hub-loss-weight", type=float, default=0.0)
+    parser.add_argument("--evidence-gate", choices=["none", "history_overlap"], default="none")
+    parser.add_argument("--evidence-floor", type=float, default=0.1)
+    parser.add_argument("--contrastive-alpha", type=float, default=0.0)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)

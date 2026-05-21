@@ -107,12 +107,27 @@ class QSDRec(nn.Module):
         dropout: float = 0.2,
         interest_router: Literal["semantic", "prefix"] = "semantic",
         prefix_level: int = 2,
+        semantic_token_hubness: torch.Tensor | None = None,
+        semantic_item_hubness: torch.Tensor | None = None,
+        hub_score_weight: float = 0.0,
+        hub_attn_weight: float = 0.0,
+        evidence_gate: Literal["none", "history_overlap"] = "none",
+        evidence_floor: float = 0.1,
+        contrastive_alpha: float = 0.0,
     ) -> None:
         super().__init__()
         if interest_router not in {"semantic", "prefix"}:
             raise ValueError(f"Unsupported interest_router: {interest_router}")
+        if evidence_gate not in {"none", "history_overlap"}:
+            raise ValueError(f"Unsupported evidence_gate: {evidence_gate}")
         self.encoder = SASRecEncoder(num_items, dim, max_len, num_heads, num_layers, dropout)
         self.register_buffer("semantic_id_table", semantic_id_table.long())
+        if semantic_token_hubness is None:
+            semantic_token_hubness = torch.zeros(num_semantic_tokens + 1, dtype=torch.float)
+        if semantic_item_hubness is None:
+            semantic_item_hubness = torch.zeros(num_items + 1, dtype=torch.float)
+        self.register_buffer("semantic_token_hubness", semantic_token_hubness.float())
+        self.register_buffer("semantic_item_hubness", semantic_item_hubness.float())
         self.semantic_emb = nn.Embedding(num_semantic_tokens + 1, dim, padding_idx=0)
         self.query_proto = nn.Parameter(torch.randn(num_interests, dim) * 0.02)
         self.id_to_query = nn.Linear(dim, dim)
@@ -135,12 +150,22 @@ class QSDRec(nn.Module):
         self.dim = dim
         self.interest_router = interest_router
         self.prefix_level = prefix_level
+        self.hub_score_weight = hub_score_weight
+        self.hub_attn_weight = hub_attn_weight
+        self.evidence_gate = evidence_gate
+        self.evidence_floor = evidence_floor
+        self.contrastive_alpha = contrastive_alpha
 
     def sequence_semantic_memory(self, seq: torch.Tensor) -> torch.Tensor:
         sid = self.semantic_id_table[seq]  # [B, L, F]
         tok = self.semantic_emb(sid)  # [B, L, F, D]
         mask = sid.ne(0).float().unsqueeze(-1)
         return (tok * mask).sum(dim=2) / mask.sum(dim=2).clamp_min(1.0)
+
+    def sequence_semantic_profile(self, seq: torch.Tensor) -> torch.Tensor:
+        memory = self.sequence_semantic_memory(seq)
+        mask = seq.ne(0).float().unsqueeze(-1)
+        return (memory * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
 
     def user_queries(self, seq: torch.Tensor, h_id: torch.Tensor) -> torch.Tensor:
         batch = seq.size(0)
@@ -155,14 +180,39 @@ class QSDRec(nn.Module):
         q, _ = self.query_attn(q, memory, memory, key_padding_mask=key_padding)
         return q
 
-    def semantic_score(self, queries: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+    def slot_evidence(self, seq: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+        cand_sid = self.semantic_id_table[candidates]  # [B, C, F]
+        hist_sid = self.semantic_id_table[seq]  # [B, L, F]
+        hist_mask = seq.ne(0).unsqueeze(-1)
+        match = cand_sid.unsqueeze(2).eq(hist_sid.unsqueeze(1)) & hist_mask.unsqueeze(1)
+        evidence = match.any(dim=2).float()
+        return evidence.clamp_min(self.evidence_floor)
+
+    def amateur_semantic_score(self, seq: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+        user_sem = self.sequence_semantic_profile(seq)
+        sid = self.semantic_id_table[candidates]
+        tok = self.sem_proj(self.semantic_emb(sid))
+        mask = sid.ne(0).float().unsqueeze(-1)
+        cand_sem = (tok * mask).sum(dim=2) / mask.sum(dim=2).clamp_min(1.0)
+        return torch.einsum("bd,bcd->bc", user_sem, cand_sem)
+
+    def semantic_score(self, queries: torch.Tensor, candidates: torch.Tensor, seq: torch.Tensor | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         sid = self.semantic_id_table[candidates]  # [B, C, F]
         tok = self.semantic_emb(sid)  # [B, C, F, D]
         tok = self.sem_proj(tok)
         q = queries.unsqueeze(1)  # [B, 1, K, D]
         attn_logits = torch.einsum("bckd,bcfd->bckf", q.expand(-1, candidates.size(1), -1, -1), tok)
         attn_logits = attn_logits / math.sqrt(self.dim)
+        token_hub = self.semantic_token_hubness[sid].unsqueeze(2)  # [B, C, 1, F]
+        if self.hub_attn_weight > 0:
+            attn_logits = attn_logits - self.hub_attn_weight * token_hub
         attn = torch.softmax(attn_logits, dim=-1)
+        if self.evidence_gate == "history_overlap" and seq is not None:
+            evidence = self.slot_evidence(seq, candidates).unsqueeze(2)  # [B, C, 1, F]
+            attn = attn * evidence
+            attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        else:
+            evidence = torch.ones_like(attn)
         resp = torch.einsum("bckf,bcfd->bckd", attn, tok)
         q_exp = q.expand(-1, candidates.size(1), -1, -1)
         if self.interest_router == "prefix":
@@ -177,19 +227,34 @@ class QSDRec(nn.Module):
             beta_in = torch.cat([q_exp, resp, q_exp * resp], dim=-1)
             beta = torch.softmax(self.beta(beta_in).squeeze(-1), dim=-1)
         dots = (q_exp * resp).sum(dim=-1)
-        return (beta * dots).sum(dim=-1)
+        score = (beta * dots).sum(dim=-1)
+        if self.hub_score_weight > 0:
+            score = score - self.hub_score_weight * self.semantic_item_hubness[candidates]
+        hub_loss = (attn * token_hub).sum(dim=-1).mean()
+        return score, {
+            "attn": attn,
+            "beta": beta,
+            "evidence": evidence,
+            "hub_loss": hub_loss,
+        }
 
     def forward(self, seq: torch.Tensor, candidates: torch.Tensor, sem_weight: float = 1.0) -> Dict[str, torch.Tensor]:
         h_id, _ = self.encoder(seq)
         cand_emb = self.encoder.item_emb(candidates)
         id_score = torch.einsum("bd,bcd->bc", h_id, cand_emb)
         queries = self.user_queries(seq, h_id)
-        sem_score = self.semantic_score(queries, candidates)
+        sem_score, sem_aux = self.semantic_score(queries, candidates, seq=seq)
+        amateur_score = None
+        if self.contrastive_alpha > 0:
+            amateur_score = self.amateur_semantic_score(seq, candidates)
+            sem_score = sem_score - self.contrastive_alpha * amateur_score
         score = id_score + sem_weight * sem_score
         return {
             "score": score,
             "id_score": id_score,
             "sem_score": sem_score,
+            "amateur_sem_score": amateur_score if amateur_score is not None else torch.zeros_like(sem_score),
+            "hub_loss": sem_aux["hub_loss"],
             "queries": queries,
         }
 

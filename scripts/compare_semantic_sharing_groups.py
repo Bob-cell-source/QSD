@@ -68,6 +68,11 @@ def load_model(checkpoint: Path, cfg: Dict[str, Any], semantic_table: torch.Tens
         dropout=float(saved_args.get("dropout", 0.2)),
         interest_router=str(saved_args.get("interest_router", "semantic")),
         prefix_level=int(saved_args.get("prefix_level", 2)),
+        hub_score_weight=float(saved_args.get("hub_score_weight", 0.0)),
+        hub_attn_weight=float(saved_args.get("hub_attn_weight", 0.0)),
+        evidence_gate=str(saved_args.get("evidence_gate", "none")),
+        evidence_floor=float(saved_args.get("evidence_floor", 0.1)),
+        contrastive_alpha=float(saved_args.get("contrastive_alpha", 0.0)),
     )
     model.load_state_dict(state["model"], strict=False)
     return model, saved_args

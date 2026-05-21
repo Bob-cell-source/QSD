@@ -40,6 +40,11 @@ def load_model(checkpoint: Path, cli_args, device: torch.device):
         dropout=float(cfg.get("dropout", 0.2)),
         interest_router=str(cfg.get("interest_router", "semantic")),
         prefix_level=int(cfg.get("prefix_level", 2)),
+        hub_score_weight=float(cfg.get("hub_score_weight", 0.0)),
+        hub_attn_weight=float(cfg.get("hub_attn_weight", 0.0)),
+        evidence_gate=str(cfg.get("evidence_gate", "none")),
+        evidence_floor=float(cfg.get("evidence_floor", 0.1)),
+        contrastive_alpha=float(cfg.get("contrastive_alpha", 0.0)),
     )
     model.load_state_dict(state["model"], strict=False)
     model.to(device)
