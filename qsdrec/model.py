@@ -111,14 +111,16 @@ class QSDRec(nn.Module):
         semantic_item_hubness: torch.Tensor | None = None,
         hub_score_weight: float = 0.0,
         hub_attn_weight: float = 0.0,
-        evidence_gate: Literal["none", "history_overlap"] = "none",
+        evidence_gate: Literal["none", "history_overlap", "reliability", "hub_reliability"] = "none",
         evidence_floor: float = 0.1,
+        evidence_recency_weight: float = 0.0,
+        evidence_hub_weight: float = 0.0,
         contrastive_alpha: float = 0.0,
     ) -> None:
         super().__init__()
         if interest_router not in {"semantic", "prefix"}:
             raise ValueError(f"Unsupported interest_router: {interest_router}")
-        if evidence_gate not in {"none", "history_overlap"}:
+        if evidence_gate not in {"none", "history_overlap", "reliability", "hub_reliability"}:
             raise ValueError(f"Unsupported evidence_gate: {evidence_gate}")
         self.encoder = SASRecEncoder(num_items, dim, max_len, num_heads, num_layers, dropout)
         self.register_buffer("semantic_id_table", semantic_id_table.long())
@@ -154,6 +156,8 @@ class QSDRec(nn.Module):
         self.hub_attn_weight = hub_attn_weight
         self.evidence_gate = evidence_gate
         self.evidence_floor = evidence_floor
+        self.evidence_recency_weight = evidence_recency_weight
+        self.evidence_hub_weight = evidence_hub_weight
         self.contrastive_alpha = contrastive_alpha
 
     def sequence_semantic_memory(self, seq: torch.Tensor) -> torch.Tensor:
@@ -185,7 +189,18 @@ class QSDRec(nn.Module):
         hist_sid = self.semantic_id_table[seq]  # [B, L, F]
         hist_mask = seq.ne(0).unsqueeze(-1)
         match = cand_sid.unsqueeze(2).eq(hist_sid.unsqueeze(1)) & hist_mask.unsqueeze(1)
-        evidence = match.any(dim=2).float()
+        if self.evidence_gate == "history_overlap":
+            evidence = match.any(dim=2).float()
+            return evidence.clamp_min(self.evidence_floor)
+
+        pos = torch.linspace(0.0, 1.0, seq.size(1), device=seq.device).view(1, 1, -1, 1)
+        recency = 1.0 + self.evidence_recency_weight * pos
+        weighted_count = (match.float() * recency).sum(dim=2)
+        support = 1.0 - torch.exp(-weighted_count)
+        evidence = self.evidence_floor + (1.0 - self.evidence_floor) * support
+        if self.evidence_gate == "hub_reliability":
+            token_hub = self.semantic_token_hubness[cand_sid]
+            evidence = evidence * (1.0 - self.evidence_hub_weight * token_hub)
         return evidence.clamp_min(self.evidence_floor)
 
     def amateur_semantic_score(self, seq: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
@@ -207,7 +222,7 @@ class QSDRec(nn.Module):
         if self.hub_attn_weight > 0:
             attn_logits = attn_logits - self.hub_attn_weight * token_hub
         attn = torch.softmax(attn_logits, dim=-1)
-        if self.evidence_gate == "history_overlap" and seq is not None:
+        if self.evidence_gate != "none" and seq is not None:
             evidence = self.slot_evidence(seq, candidates).unsqueeze(2)  # [B, C, 1, F]
             attn = attn * evidence
             attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
