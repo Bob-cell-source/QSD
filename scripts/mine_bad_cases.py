@@ -46,6 +46,10 @@ def load_model(checkpoint: Path, cli_args, device: torch.device):
         evidence_floor=float(cfg.get("evidence_floor", 0.1)),
         evidence_recency_weight=float(cfg.get("evidence_recency_weight", 0.0)),
         evidence_hub_weight=float(cfg.get("evidence_hub_weight", 0.0)),
+        evidence_cross_weight=float(cfg.get("evidence_cross_weight", 0.2)),
+        hub_penalty_weight=float(cfg.get("hub_penalty_weight", 0.0)),
+        semantic_fusion=str(cfg.get("semantic_fusion", "fixed")),
+        fusion_floor=float(cfg.get("fusion_floor", 0.0)),
         contrastive_alpha=float(cfg.get("contrastive_alpha", 0.0)),
     )
     model.load_state_dict(state["model"], strict=False)

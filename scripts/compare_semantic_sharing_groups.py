@@ -74,6 +74,10 @@ def load_model(checkpoint: Path, cfg: Dict[str, Any], semantic_table: torch.Tens
         evidence_floor=float(saved_args.get("evidence_floor", 0.1)),
         evidence_recency_weight=float(saved_args.get("evidence_recency_weight", 0.0)),
         evidence_hub_weight=float(saved_args.get("evidence_hub_weight", 0.0)),
+        evidence_cross_weight=float(saved_args.get("evidence_cross_weight", 0.2)),
+        hub_penalty_weight=float(saved_args.get("hub_penalty_weight", 0.0)),
+        semantic_fusion=str(saved_args.get("semantic_fusion", "fixed")),
+        fusion_floor=float(saved_args.get("fusion_floor", 0.0)),
         contrastive_alpha=float(saved_args.get("contrastive_alpha", 0.0)),
     )
     model.load_state_dict(state["model"], strict=False)

@@ -111,17 +111,41 @@ class QSDRec(nn.Module):
         semantic_item_hubness: torch.Tensor | None = None,
         hub_score_weight: float = 0.0,
         hub_attn_weight: float = 0.0,
-        evidence_gate: Literal["none", "history_overlap", "reliability", "hub_reliability"] = "none",
+        evidence_gate: Literal[
+            "none",
+            "history_overlap",
+            "reliability",
+            "hub_reliability",
+            "strength",
+            "strength_idf",
+            "cross_strength_idf",
+            "learnable",
+        ] = "none",
         evidence_floor: float = 0.1,
         evidence_recency_weight: float = 0.0,
         evidence_hub_weight: float = 0.0,
+        evidence_cross_weight: float = 0.2,
+        hub_penalty_weight: float = 0.0,
+        semantic_fusion: Literal["fixed", "evidence_coverage"] = "fixed",
+        fusion_floor: float = 0.0,
         contrastive_alpha: float = 0.0,
     ) -> None:
         super().__init__()
         if interest_router not in {"semantic", "prefix"}:
             raise ValueError(f"Unsupported interest_router: {interest_router}")
-        if evidence_gate not in {"none", "history_overlap", "reliability", "hub_reliability"}:
+        if evidence_gate not in {
+            "none",
+            "history_overlap",
+            "reliability",
+            "hub_reliability",
+            "strength",
+            "strength_idf",
+            "cross_strength_idf",
+            "learnable",
+        }:
             raise ValueError(f"Unsupported evidence_gate: {evidence_gate}")
+        if semantic_fusion not in {"fixed", "evidence_coverage"}:
+            raise ValueError(f"Unsupported semantic_fusion: {semantic_fusion}")
         self.encoder = SASRecEncoder(num_items, dim, max_len, num_heads, num_layers, dropout)
         self.register_buffer("semantic_id_table", semantic_id_table.long())
         if semantic_token_hubness is None:
@@ -148,6 +172,11 @@ class QSDRec(nn.Module):
             nn.Linear(dim, 1),
         )
         self.prefix_proj = nn.Linear(dim, dim)
+        self.evidence_mlp = nn.Sequential(
+            nn.Linear(4, max(8, dim // 8)),
+            nn.GELU(),
+            nn.Linear(max(8, dim // 8), 1),
+        )
         self.num_interests = num_interests
         self.dim = dim
         self.interest_router = interest_router
@@ -158,6 +187,10 @@ class QSDRec(nn.Module):
         self.evidence_floor = evidence_floor
         self.evidence_recency_weight = evidence_recency_weight
         self.evidence_hub_weight = evidence_hub_weight
+        self.evidence_cross_weight = evidence_cross_weight
+        self.hub_penalty_weight = hub_penalty_weight
+        self.semantic_fusion = semantic_fusion
+        self.fusion_floor = fusion_floor
         self.contrastive_alpha = contrastive_alpha
 
     def sequence_semantic_memory(self, seq: torch.Tensor) -> torch.Tensor:
@@ -184,24 +217,75 @@ class QSDRec(nn.Module):
         q, _ = self.query_attn(q, memory, memory, key_padding_mask=key_padding)
         return q
 
-    def slot_evidence(self, seq: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+    def slot_evidence_features(self, seq: torch.Tensor, candidates: torch.Tensor) -> Dict[str, torch.Tensor]:
         cand_sid = self.semantic_id_table[candidates]  # [B, C, F]
         hist_sid = self.semantic_id_table[seq]  # [B, L, F]
         hist_mask = seq.ne(0).unsqueeze(-1)
         match = cand_sid.unsqueeze(2).eq(hist_sid.unsqueeze(1)) & hist_mask.unsqueeze(1)
-        if self.evidence_gate == "history_overlap":
-            evidence = match.any(dim=2).float()
-            return evidence.clamp_min(self.evidence_floor)
-
         pos = torch.linspace(0.0, 1.0, seq.size(1), device=seq.device).view(1, 1, -1, 1)
-        recency = 1.0 + self.evidence_recency_weight * pos
-        weighted_count = (match.float() * recency).sum(dim=2)
-        support = 1.0 - torch.exp(-weighted_count)
+        if self.evidence_recency_weight > 0:
+            recency = torch.exp(-self.evidence_recency_weight * (1.0 - pos))
+        else:
+            recency = torch.ones_like(pos)
+        same_count = (match.float() * recency).sum(dim=2)
+        same_strength = 1.0 - torch.exp(-same_count)
+        latest_support = (match.float() * pos).amax(dim=2)
+        specificity = (1.0 - self.semantic_token_hubness[cand_sid]).clamp(0.0, 1.0)
+
+        cross_strength = torch.zeros_like(same_strength)
+        if self.evidence_gate in {"cross_strength_idf", "learnable"}:
+            cand_by_slot = cand_sid.unsqueeze(3).unsqueeze(4)  # [B, C, F, 1, 1]
+            hist_by_slot = hist_sid.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, L, F]
+            cross_match = cand_by_slot.eq(hist_by_slot)
+            cross_match = cross_match & hist_mask.unsqueeze(1).unsqueeze(1)
+            slots = cand_sid.size(-1)
+            slot_eye = torch.eye(slots, dtype=torch.bool, device=seq.device).view(1, 1, slots, 1, slots)
+            cross_match = cross_match & ~slot_eye
+            cross_pos = pos.unsqueeze(2)
+            cross_count = (cross_match.float() * cross_pos.new_ones(cross_pos.shape) * recency.unsqueeze(2)).sum(dim=(3, 4))
+            cross_strength = 1.0 - torch.exp(-cross_count)
+
+        return {
+            "same_binary": match.any(dim=2).float(),
+            "same_strength": same_strength,
+            "cross_strength": cross_strength,
+            "latest_support": latest_support,
+            "specificity": specificity,
+        }
+
+    def slot_evidence(self, seq: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+        features = self.slot_evidence_features(seq, candidates)
+        if self.evidence_gate == "history_overlap":
+            return features["same_binary"].clamp_min(self.evidence_floor)
+
+        support = features["same_strength"]
+        if self.evidence_gate in {"strength_idf", "hub_reliability"}:
+            support = support * features["specificity"]
+        elif self.evidence_gate == "cross_strength_idf":
+            support = (support + self.evidence_cross_weight * features["cross_strength"]).clamp_max(1.0)
+            support = support * features["specificity"]
+        elif self.evidence_gate == "learnable":
+            mlp_input = torch.stack(
+                [
+                    features["same_strength"],
+                    features["cross_strength"],
+                    features["specificity"],
+                    features["latest_support"],
+                ],
+                dim=-1,
+            )
+            support = torch.sigmoid(self.evidence_mlp(mlp_input).squeeze(-1))
+
         evidence = self.evidence_floor + (1.0 - self.evidence_floor) * support
         if self.evidence_gate == "hub_reliability":
+            cand_sid = self.semantic_id_table[candidates]
             token_hub = self.semantic_token_hubness[cand_sid]
             evidence = evidence * (1.0 - self.evidence_hub_weight * token_hub)
         return evidence.clamp_min(self.evidence_floor)
+
+    def evidence_coverage(self, seq: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+        features = self.slot_evidence_features(seq, candidates)
+        return features["same_binary"].mean(dim=-1)
 
     def amateur_semantic_score(self, seq: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
         user_sem = self.sequence_semantic_profile(seq)
@@ -243,6 +327,10 @@ class QSDRec(nn.Module):
             beta = torch.softmax(self.beta(beta_in).squeeze(-1), dim=-1)
         dots = (q_exp * resp).sum(dim=-1)
         score = (beta * dots).sum(dim=-1)
+        if self.hub_penalty_weight > 0:
+            token_hub_by_query = (attn * token_hub).sum(dim=-1)
+            hub_penalty = (beta * token_hub_by_query).sum(dim=-1)
+            score = score - self.hub_penalty_weight * hub_penalty
         if self.hub_score_weight > 0:
             score = score - self.hub_score_weight * self.semantic_item_hubness[candidates]
         hub_loss = (attn * token_hub).sum(dim=-1).mean()
@@ -263,7 +351,12 @@ class QSDRec(nn.Module):
         if self.contrastive_alpha > 0:
             amateur_score = self.amateur_semantic_score(seq, candidates)
             sem_score = sem_score - self.contrastive_alpha * amateur_score
-        score = id_score + sem_weight * sem_score
+        if self.semantic_fusion == "evidence_coverage":
+            coverage = self.evidence_coverage(seq, candidates)
+            sem_scale = sem_weight * (self.fusion_floor + (1.0 - self.fusion_floor) * coverage)
+            score = id_score + sem_scale * sem_score
+        else:
+            score = id_score + sem_weight * sem_score
         return {
             "score": score,
             "id_score": id_score,

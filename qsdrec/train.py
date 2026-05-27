@@ -316,6 +316,10 @@ def train(args) -> None:
         evidence_floor=args.evidence_floor,
         evidence_recency_weight=args.evidence_recency_weight,
         evidence_hub_weight=args.evidence_hub_weight,
+        evidence_cross_weight=args.evidence_cross_weight,
+        hub_penalty_weight=args.hub_penalty_weight,
+        semantic_fusion=args.semantic_fusion,
+        fusion_floor=args.fusion_floor,
         contrastive_alpha=args.contrastive_alpha,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -429,10 +433,27 @@ def main() -> None:
     parser.add_argument("--hub-score-weight", type=float, default=0.0)
     parser.add_argument("--hub-attn-weight", type=float, default=0.0)
     parser.add_argument("--hub-loss-weight", type=float, default=0.0)
-    parser.add_argument("--evidence-gate", choices=["none", "history_overlap", "reliability", "hub_reliability"], default="none")
+    parser.add_argument(
+        "--evidence-gate",
+        choices=[
+            "none",
+            "history_overlap",
+            "reliability",
+            "hub_reliability",
+            "strength",
+            "strength_idf",
+            "cross_strength_idf",
+            "learnable",
+        ],
+        default="none",
+    )
     parser.add_argument("--evidence-floor", type=float, default=0.1)
     parser.add_argument("--evidence-recency-weight", type=float, default=0.0)
     parser.add_argument("--evidence-hub-weight", type=float, default=0.0)
+    parser.add_argument("--evidence-cross-weight", type=float, default=0.2)
+    parser.add_argument("--hub-penalty-weight", type=float, default=0.0)
+    parser.add_argument("--semantic-fusion", choices=["fixed", "evidence_coverage"], default="fixed")
+    parser.add_argument("--fusion-floor", type=float, default=0.0)
     parser.add_argument("--contrastive-alpha", type=float, default=0.0)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
