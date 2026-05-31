@@ -95,6 +95,7 @@ log/
 # Data files
 # =========================
 data/raw/
+data/
 data/intermediate/
 data/processed/
 datasets/

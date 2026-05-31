@@ -152,6 +152,41 @@ def build_semantic_hubness(semantic_table: torch.Tensor, num_semantic_tokens: in
     return token_hub, item_hub
 
 
+def build_log_prior(table: torch.Tensor, num_tokens: int, alpha: float = 1.0) -> torch.Tensor:
+    token_counts = torch.zeros(num_tokens + 1, dtype=torch.float)
+    item_sids = table[1:]
+    valid = item_sids.gt(0)
+    token_counts.scatter_add_(0, item_sids[valid], torch.ones_like(item_sids[valid], dtype=torch.float))
+    denom = token_counts[1:].sum() + alpha * max(num_tokens, 1)
+    log_prior = torch.log((token_counts + alpha) / denom.clamp_min(1.0))
+    log_prior[0] = 0.0
+    return log_prior
+
+
+def load_mini_cluster_table(
+    mini_cluster_path: str | None,
+    num_items: int,
+    fallback_table: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not mini_cluster_path:
+        num_tokens = int(fallback_table.max().item())
+        return fallback_table.clone(), build_log_prior(fallback_table, num_tokens)
+
+    obj = read_json(mini_cluster_path)
+    raw = {int(k): list(map(int, v)) for k, v in obj["mini_cluster_ids"].items()}
+    depth = fallback_table.size(1)
+    num_tokens = int(obj.get("num_mini_clusters", 0))
+    table = torch.zeros(num_items + 1, depth, dtype=torch.long)
+    for item in range(1, num_items + 1):
+        codes = raw.get(item)
+        if codes is None:
+            table[item] = fallback_table[item]
+        else:
+            table[item] = torch.tensor(codes, dtype=torch.long)
+            num_tokens = max(num_tokens, max(codes) if codes else 0)
+    return table, build_log_prior(table, num_tokens)
+
+
 def cross_entropy_first_positive(scores: torch.Tensor) -> torch.Tensor:
     labels = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
     return torch.nn.functional.cross_entropy(scores, labels)
@@ -260,6 +295,12 @@ def train(args) -> None:
     num_items = int(stats["num_items"])
     semantic_table, item_semantic_ids, num_semantic_tokens = build_semantic_table(semantic_obj, num_items)
     semantic_token_hubness, semantic_item_hubness = build_semantic_hubness(semantic_table, num_semantic_tokens)
+    semantic_token_log_prior = build_log_prior(semantic_table, num_semantic_tokens)
+    mini_cluster_table, mini_cluster_log_prior = load_mini_cluster_table(
+        args.mini_clusters,
+        num_items,
+        semantic_table,
+    )
 
     train_data = NextItemDataset(sequences, args.max_len, "train")
     valid_data = NextItemDataset(sequences, args.max_len, "valid")
@@ -310,6 +351,9 @@ def train(args) -> None:
         prefix_level=args.prefix_level,
         semantic_token_hubness=semantic_token_hubness,
         semantic_item_hubness=semantic_item_hubness,
+        semantic_token_log_prior=semantic_token_log_prior,
+        mini_cluster_table=mini_cluster_table,
+        mini_cluster_log_prior=mini_cluster_log_prior,
         hub_score_weight=args.hub_score_weight,
         hub_attn_weight=args.hub_attn_weight,
         evidence_gate=args.evidence_gate,
@@ -317,6 +361,9 @@ def train(args) -> None:
         evidence_recency_weight=args.evidence_recency_weight,
         evidence_hub_weight=args.evidence_hub_weight,
         evidence_cross_weight=args.evidence_cross_weight,
+        prior_lift_alpha=args.prior_lift_alpha,
+        prior_lift_tau=args.prior_lift_tau,
+        prior_lift_eta=args.prior_lift_eta,
         hub_penalty_weight=args.hub_penalty_weight,
         semantic_fusion=args.semantic_fusion,
         fusion_floor=args.fusion_floor,
@@ -444,13 +491,19 @@ def main() -> None:
             "strength_idf",
             "cross_strength_idf",
             "learnable",
+            "prior_lift",
+            "mini_lift",
         ],
         default="none",
     )
+    parser.add_argument("--mini-clusters", default=None)
     parser.add_argument("--evidence-floor", type=float, default=0.1)
     parser.add_argument("--evidence-recency-weight", type=float, default=0.0)
     parser.add_argument("--evidence-hub-weight", type=float, default=0.0)
     parser.add_argument("--evidence-cross-weight", type=float, default=0.2)
+    parser.add_argument("--prior-lift-alpha", type=float, default=0.1)
+    parser.add_argument("--prior-lift-tau", type=float, default=1.0)
+    parser.add_argument("--prior-lift-eta", type=float, default=1.0)
     parser.add_argument("--hub-penalty-weight", type=float, default=0.0)
     parser.add_argument("--semantic-fusion", choices=["fixed", "evidence_coverage"], default="fixed")
     parser.add_argument("--fusion-floor", type=float, default=0.0)

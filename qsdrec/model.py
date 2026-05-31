@@ -120,11 +120,19 @@ class QSDRec(nn.Module):
             "strength_idf",
             "cross_strength_idf",
             "learnable",
+            "prior_lift",
+            "mini_lift",
         ] = "none",
         evidence_floor: float = 0.1,
         evidence_recency_weight: float = 0.0,
         evidence_hub_weight: float = 0.0,
         evidence_cross_weight: float = 0.2,
+        semantic_token_log_prior: torch.Tensor | None = None,
+        mini_cluster_table: torch.Tensor | None = None,
+        mini_cluster_log_prior: torch.Tensor | None = None,
+        prior_lift_alpha: float = 0.1,
+        prior_lift_tau: float = 1.0,
+        prior_lift_eta: float = 1.0,
         hub_penalty_weight: float = 0.0,
         semantic_fusion: Literal["fixed", "evidence_coverage"] = "fixed",
         fusion_floor: float = 0.0,
@@ -142,6 +150,8 @@ class QSDRec(nn.Module):
             "strength_idf",
             "cross_strength_idf",
             "learnable",
+            "prior_lift",
+            "mini_lift",
         }:
             raise ValueError(f"Unsupported evidence_gate: {evidence_gate}")
         if semantic_fusion not in {"fixed", "evidence_coverage"}:
@@ -152,8 +162,17 @@ class QSDRec(nn.Module):
             semantic_token_hubness = torch.zeros(num_semantic_tokens + 1, dtype=torch.float)
         if semantic_item_hubness is None:
             semantic_item_hubness = torch.zeros(num_items + 1, dtype=torch.float)
+        if semantic_token_log_prior is None:
+            semantic_token_log_prior = torch.zeros(num_semantic_tokens + 1, dtype=torch.float)
+        if mini_cluster_table is None:
+            mini_cluster_table = semantic_id_table.long()
+        if mini_cluster_log_prior is None:
+            mini_cluster_log_prior = semantic_token_log_prior.float()
         self.register_buffer("semantic_token_hubness", semantic_token_hubness.float())
         self.register_buffer("semantic_item_hubness", semantic_item_hubness.float())
+        self.register_buffer("semantic_token_log_prior", semantic_token_log_prior.float())
+        self.register_buffer("mini_cluster_table", mini_cluster_table.long())
+        self.register_buffer("mini_cluster_log_prior", mini_cluster_log_prior.float())
         self.semantic_emb = nn.Embedding(num_semantic_tokens + 1, dim, padding_idx=0)
         self.query_proto = nn.Parameter(torch.randn(num_interests, dim) * 0.02)
         self.id_to_query = nn.Linear(dim, dim)
@@ -188,6 +207,9 @@ class QSDRec(nn.Module):
         self.evidence_recency_weight = evidence_recency_weight
         self.evidence_hub_weight = evidence_hub_weight
         self.evidence_cross_weight = evidence_cross_weight
+        self.prior_lift_alpha = prior_lift_alpha
+        self.prior_lift_tau = prior_lift_tau
+        self.prior_lift_eta = prior_lift_eta
         self.hub_penalty_weight = hub_penalty_weight
         self.semantic_fusion = semantic_fusion
         self.fusion_floor = fusion_floor
@@ -287,6 +309,33 @@ class QSDRec(nn.Module):
         features = self.slot_evidence_features(seq, candidates)
         return features["same_binary"].mean(dim=-1)
 
+    def prior_lift(self, seq: torch.Tensor, candidates: torch.Tensor, use_mini: bool = False) -> torch.Tensor:
+        if use_mini:
+            cand_key = self.mini_cluster_table[candidates]
+            hist_key = self.mini_cluster_table[seq]
+            log_prior_table = self.mini_cluster_log_prior
+        else:
+            cand_key = self.semantic_id_table[candidates]
+            hist_key = self.semantic_id_table[seq]
+            log_prior_table = self.semantic_token_log_prior
+
+        hist_mask = seq.ne(0).unsqueeze(-1)
+        match = cand_key.unsqueeze(2).eq(hist_key.unsqueeze(1)) & hist_mask.unsqueeze(1)
+        pos = torch.linspace(0.0, 1.0, seq.size(1), device=seq.device).view(1, 1, -1, 1)
+        if self.evidence_recency_weight > 0:
+            recency = torch.exp(-self.evidence_recency_weight * (1.0 - pos))
+        else:
+            recency = torch.ones_like(pos)
+
+        counts = (match.float() * recency).sum(dim=2)
+        hist_total = (hist_mask.float() * recency.squeeze(1)).sum(dim=(1, 2)).view(-1, 1, 1)
+        num_keys = max(int(log_prior_table.numel() - 1), 1)
+        log_user_prob = torch.log(counts + self.prior_lift_alpha)
+        log_user_prob = log_user_prob - torch.log(hist_total + self.prior_lift_alpha * num_keys)
+        log_global_prob = log_prior_table[cand_key]
+        lift = log_user_prob - self.prior_lift_tau * log_global_prob
+        return lift.clamp(min=-8.0, max=8.0)
+
     def amateur_semantic_score(self, seq: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
         user_sem = self.sequence_semantic_profile(seq)
         sid = self.semantic_id_table[candidates]
@@ -305,8 +354,14 @@ class QSDRec(nn.Module):
         token_hub = self.semantic_token_hubness[sid].unsqueeze(2)  # [B, C, 1, F]
         if self.hub_attn_weight > 0:
             attn_logits = attn_logits - self.hub_attn_weight * token_hub
+        if self.evidence_gate == "prior_lift" and seq is not None:
+            lift = self.prior_lift(seq, candidates, use_mini=False).unsqueeze(2)
+            attn_logits = attn_logits + self.prior_lift_eta * lift
+        elif self.evidence_gate == "mini_lift" and seq is not None:
+            lift = self.prior_lift(seq, candidates, use_mini=True).unsqueeze(2)
+            attn_logits = attn_logits + self.prior_lift_eta * lift
         attn = torch.softmax(attn_logits, dim=-1)
-        if self.evidence_gate != "none" and seq is not None:
+        if self.evidence_gate not in {"none", "prior_lift", "mini_lift"} and seq is not None:
             evidence = self.slot_evidence(seq, candidates).unsqueeze(2)  # [B, C, 1, F]
             attn = attn * evidence
             attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)

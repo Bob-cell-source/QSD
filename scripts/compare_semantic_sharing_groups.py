@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qsdrec.io_utils import read_json, write_json
 from qsdrec.model import QSDRec
-from qsdrec.train import NextItemDataset, build_semantic_table, collate_full_eval
+from qsdrec.train import NextItemDataset, build_log_prior, build_semantic_table, collate_full_eval, load_mini_cluster_table
 
 
 def parse_bucket_spec(spec: str):
@@ -56,6 +56,12 @@ def load_model(checkpoint: Path, cfg: Dict[str, Any], semantic_table: torch.Tens
     for key in ["dataset_dir", "semantic_ids", "device", "batch_size", "eval_batch_eval_size"]:
         if key in cfg:
             saved_args[key] = cfg[key]
+    semantic_token_log_prior = build_log_prior(semantic_table, num_semantic_tokens)
+    mini_cluster_table, mini_cluster_log_prior = load_mini_cluster_table(
+        saved_args.get("mini_clusters"),
+        num_items,
+        semantic_table,
+    )
     model = QSDRec(
         num_items=num_items,
         num_semantic_tokens=num_semantic_tokens,
@@ -68,6 +74,9 @@ def load_model(checkpoint: Path, cfg: Dict[str, Any], semantic_table: torch.Tens
         dropout=float(saved_args.get("dropout", 0.2)),
         interest_router=str(saved_args.get("interest_router", "semantic")),
         prefix_level=int(saved_args.get("prefix_level", 2)),
+        semantic_token_log_prior=semantic_token_log_prior,
+        mini_cluster_table=mini_cluster_table,
+        mini_cluster_log_prior=mini_cluster_log_prior,
         hub_score_weight=float(saved_args.get("hub_score_weight", 0.0)),
         hub_attn_weight=float(saved_args.get("hub_attn_weight", 0.0)),
         evidence_gate=str(saved_args.get("evidence_gate", "none")),
@@ -75,6 +84,9 @@ def load_model(checkpoint: Path, cfg: Dict[str, Any], semantic_table: torch.Tens
         evidence_recency_weight=float(saved_args.get("evidence_recency_weight", 0.0)),
         evidence_hub_weight=float(saved_args.get("evidence_hub_weight", 0.0)),
         evidence_cross_weight=float(saved_args.get("evidence_cross_weight", 0.2)),
+        prior_lift_alpha=float(saved_args.get("prior_lift_alpha", 0.1)),
+        prior_lift_tau=float(saved_args.get("prior_lift_tau", 1.0)),
+        prior_lift_eta=float(saved_args.get("prior_lift_eta", 1.0)),
         hub_penalty_weight=float(saved_args.get("hub_penalty_weight", 0.0)),
         semantic_fusion=str(saved_args.get("semantic_fusion", "fixed")),
         fusion_floor=float(saved_args.get("fusion_floor", 0.0)),

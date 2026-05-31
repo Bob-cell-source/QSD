@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qsdrec.io_utils import read_json, write_json
 from qsdrec.model import QSDRec
-from qsdrec.train import NextItemDataset, build_semantic_table, collate_full_eval
+from qsdrec.train import NextItemDataset, build_log_prior, build_semantic_table, collate_full_eval, load_mini_cluster_table
 
 
 def parse_bucket_spec(spec: str):
@@ -184,6 +184,12 @@ def main() -> None:
     semantic_obj = read_json(semantic_ids)
     num_items = int(stats["num_items"])
     semantic_table, item_semantic_ids, num_semantic_tokens = build_semantic_table(semantic_obj, num_items)
+    semantic_token_log_prior = build_log_prior(semantic_table, num_semantic_tokens)
+    mini_cluster_table, mini_cluster_log_prior = load_mini_cluster_table(
+        cfg.get("mini_clusters"),
+        num_items,
+        semantic_table,
+    )
     item_group_sizes = build_prefix_group_sizes(item_semantic_ids, prefix_level)
 
     test_data = NextItemDataset(sequences, int(cfg.get("max_len", 50)), "test")
@@ -207,6 +213,9 @@ def main() -> None:
         dropout=float(cfg.get("dropout", 0.2)),
         interest_router=str(cfg.get("interest_router", "semantic")),
         prefix_level=int(cfg.get("prefix_level", 2)),
+        semantic_token_log_prior=semantic_token_log_prior,
+        mini_cluster_table=mini_cluster_table,
+        mini_cluster_log_prior=mini_cluster_log_prior,
         hub_score_weight=float(cfg.get("hub_score_weight", 0.0)),
         hub_attn_weight=float(cfg.get("hub_attn_weight", 0.0)),
         evidence_gate=str(cfg.get("evidence_gate", "none")),
@@ -214,6 +223,9 @@ def main() -> None:
         evidence_recency_weight=float(cfg.get("evidence_recency_weight", 0.0)),
         evidence_hub_weight=float(cfg.get("evidence_hub_weight", 0.0)),
         evidence_cross_weight=float(cfg.get("evidence_cross_weight", 0.2)),
+        prior_lift_alpha=float(cfg.get("prior_lift_alpha", 0.1)),
+        prior_lift_tau=float(cfg.get("prior_lift_tau", 1.0)),
+        prior_lift_eta=float(cfg.get("prior_lift_eta", 1.0)),
         hub_penalty_weight=float(cfg.get("hub_penalty_weight", 0.0)),
         semantic_fusion=str(cfg.get("semantic_fusion", "fixed")),
         fusion_floor=float(cfg.get("fusion_floor", 0.0)),
