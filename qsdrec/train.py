@@ -347,7 +347,7 @@ def train(args) -> None:
     )
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    if args.model_variant == "crsid":
+    if args.model_variant in {"crsid", "crsid_semhub"}:
         model = CRSIDRec(
             num_items=num_items,
             num_semantic_tokens=num_semantic_tokens,
@@ -360,6 +360,10 @@ def train(args) -> None:
             dropout=args.dropout,
             tail_tau=args.cr_tail_tau,
             residual_scale=args.cr_residual_scale,
+            alpha_mode="semantic_hubness" if args.model_variant == "crsid_semhub" else "item_frequency",
+            semantic_token_hubness=semantic_token_hubness,
+            hub_alpha_floor=args.cr_hub_alpha_floor,
+            hub_alpha_gamma=args.cr_hub_alpha_gamma,
         ).to(device)
     else:
         model = QSDRec(
@@ -424,7 +428,7 @@ def train(args) -> None:
                 candidates = candidates.to(device)
                 out = model(seq, candidates, sem_weight=args.sem_weight)
                 rec_loss = cross_entropy_first_positive(out["score"])
-                if args.model_variant == "crsid":
+                if args.model_variant in {"crsid", "crsid_semhub"}:
                     loss = rec_loss + args.cr_residual_reg * out["residual_l2"]
                 else:
                     dis_loss = cross_entropy_first_positive(out["sem_score"])
@@ -495,7 +499,7 @@ def train(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-variant", choices=["qsdrec", "crsid"], default="qsdrec")
+    parser.add_argument("--model-variant", choices=["qsdrec", "crsid", "crsid_semhub"], default="qsdrec")
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--semantic-ids", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -540,6 +544,8 @@ def main() -> None:
     parser.add_argument("--cr-tail-tau", type=float, default=20.0)
     parser.add_argument("--cr-residual-scale", type=float, default=1.0)
     parser.add_argument("--cr-residual-reg", type=float, default=0.0)
+    parser.add_argument("--cr-hub-alpha-floor", type=float, default=0.05)
+    parser.add_argument("--cr-hub-alpha-gamma", type=float, default=1.0)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)

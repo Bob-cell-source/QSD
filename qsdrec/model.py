@@ -170,10 +170,19 @@ class CRSIDRec(nn.Module):
         dropout: float = 0.2,
         tail_tau: float = 20.0,
         residual_scale: float = 1.0,
+        alpha_mode: Literal["item_frequency", "semantic_hubness"] = "item_frequency",
+        semantic_token_hubness: torch.Tensor | None = None,
+        hub_alpha_floor: float = 0.05,
+        hub_alpha_gamma: float = 1.0,
     ) -> None:
         super().__init__()
+        if alpha_mode not in {"item_frequency", "semantic_hubness"}:
+            raise ValueError(f"Unsupported alpha_mode: {alpha_mode}")
         self.encoder = SASRecDynamicEncoder(dim, max_len, num_heads, num_layers, dropout)
         self.register_buffer("semantic_id_table", semantic_id_table.long())
+        if semantic_token_hubness is None:
+            semantic_token_hubness = torch.zeros(num_semantic_tokens + 1, dtype=torch.float)
+        self.register_buffer("semantic_token_hubness", semantic_token_hubness.float())
         freq = item_frequency.float().clamp_min(0.0)
         alpha = freq / (freq + float(tail_tau))
         alpha[0] = 0.0
@@ -185,6 +194,9 @@ class CRSIDRec(nn.Module):
         self.out_norm = nn.LayerNorm(dim, eps=1e-8)
         self.dropout = nn.Dropout(dropout)
         self.residual_scale = residual_scale
+        self.alpha_mode = alpha_mode
+        self.hub_alpha_floor = hub_alpha_floor
+        self.hub_alpha_gamma = hub_alpha_gamma
         self.dim = dim
         self._init_weights()
 
@@ -203,11 +215,24 @@ class CRSIDRec(nn.Module):
         mask = sid.ne(0).float().unsqueeze(-1)
         return (tok * mask).sum(dim=-2) / mask.sum(dim=-2).clamp_min(1.0)
 
+    def residual_alpha(self, items: torch.Tensor) -> torch.Tensor:
+        if self.alpha_mode == "item_frequency":
+            return self.item_residual_alpha[items].unsqueeze(-1)
+
+        sid = self.semantic_id_table[items]
+        mask = sid.ne(0).float()
+        token_hub = self.semantic_token_hubness[sid]
+        hub = (token_hub * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
+        if self.hub_alpha_gamma != 1.0:
+            hub = hub.clamp(0.0, 1.0).pow(self.hub_alpha_gamma)
+        alpha = self.hub_alpha_floor + (1.0 - self.hub_alpha_floor) * hub
+        return alpha.clamp(0.0, 1.0).unsqueeze(-1)
+
     def item_representation(self, items: torch.Tensor) -> torch.Tensor:
         basis = self.basis_proj(self.semantic_pool(self.semantic_basis_emb, items))
         shared_residual = self.semantic_pool(self.semantic_residual_emb, items)
         private_residual = self.item_residual_emb(items)
-        alpha = self.item_residual_alpha[items].unsqueeze(-1)
+        alpha = self.residual_alpha(items)
         residual = alpha * private_residual + (1.0 - alpha) * shared_residual
         out = self.out_norm(basis + self.residual_scale * residual)
         return self.dropout(out) * items.ne(0).unsqueeze(-1)

@@ -131,6 +131,96 @@ final semantic score:
 
 建议先看单机制结果，再跑组合。
 
+### V5: CR-SID Item-frequency Residual
+
+对应想法：用一个统一 item representation 替代多分支 late fusion。
+
+实现位置：
+
+```text
+qsdrec/model.py
+qsdrec/train.py
+scripts/train_crsid.py
+```
+
+新增参数：
+
+```text
+--model-variant crsid
+--cr-tail-tau
+--cr-residual-scale
+--cr-residual-reg
+```
+
+当前实现：
+
+```text
+e_i = semantic_basis(z_i)
+    + residual_scale * [alpha_i * private_item_residual
+                        + (1 - alpha_i) * shared_semantic_residual]
+
+alpha_i = item_train_frequency_i / (item_train_frequency_i + tau)
+```
+
+说明：
+
+```text
+该版本保留作为 CR-SID 的初始版本。
+它关注 item-frequency long-tail，不直接针对 Semantic ID token 的头部 hub 问题。
+```
+
+### V6: CR-SID Semantic-hub Residual
+
+对应想法：Semantic ID token 本身存在长尾/头部 hub，alpha 不再由 item 频次决定，而由 item 的 Semantic ID token hubness 决定。
+
+实现位置：
+
+```text
+qsdrec/model.py
+qsdrec/train.py
+scripts/train_crsid_semhub.py
+```
+
+新增参数：
+
+```text
+--model-variant crsid_semhub
+--cr-residual-scale
+--cr-residual-reg
+--cr-hub-alpha-floor
+--cr-hub-alpha-gamma
+```
+
+当前实现：
+
+```text
+hub(z_i) = mean(normalized_log_frequency(z_i1), ..., normalized_log_frequency(z_i4))
+
+alpha_i = hub_alpha_floor + (1 - hub_alpha_floor) * hub(z_i)^gamma
+
+e_i = semantic_basis(z_i)
+    + residual_scale * [alpha_i * private_item_residual
+                        + (1 - alpha_i) * shared_semantic_residual]
+```
+
+直观解释：
+
+```text
+如果 item 的 Semantic ID token 多为热门 hub token，
+说明 shared semantic residual 更容易混入泛办公主题和 shortcut，
+因此提高 private residual 比例。
+
+如果 item 的 Semantic ID token 更偏尾部，
+说明共享语义更有区分度，
+因此保留更多 shared semantic residual。
+```
+
+该版本更贴合当前 badcase 观察：
+
+```text
+问题不是普通 item long-tail，而是 Semantic ID token sharing imbalance。
+```
+
 ## 2. 暂未实现或需单独分支的版本
 
 ### Global Semantic Anchor Tokenizer
@@ -226,6 +316,128 @@ exp_evidence_f020_k8_sem010
 exp_contrastive005_k8_sem010
 exp_evidence_hub_k8_sem010
 exp_evidence_contrastive_k8_sem010
+```
+
+### 3.1 版本运行指令
+
+以下命令都写入不同输出目录，不会覆盖已有版本。
+
+#### V0: SASRec Baseline
+
+```bash
+/voice/bin/python scripts/train_qsdrec.py \
+  --model-variant qsdrec \
+  --dataset-dir runs/office \
+  --semantic-ids runs/office/semantic_ids_rq.json \
+  --output-dir runs/office/exp_sasrec \
+  --device cuda \
+  --epochs 100 \
+  --early-stop-patience 10 \
+  --batch-size 256 \
+  --max-len 50 \
+  --dim 128 \
+  --num-interests 1 \
+  --num-hard-neg 0 \
+  --num-random-neg 100 \
+  --sem-weight 0 \
+  --dis-weight 0 \
+  --div-weight 0
+```
+
+#### V0: QSDRec Reference
+
+```bash
+/voice/bin/python scripts/train_qsdrec.py \
+  --model-variant qsdrec \
+  --dataset-dir runs/office \
+  --semantic-ids runs/office/semantic_ids_rq.json \
+  --output-dir runs/office/exp_interest8_sem010 \
+  --device cuda \
+  --epochs 100 \
+  --early-stop-patience 10 \
+  --batch-size 256 \
+  --max-len 50 \
+  --dim 128 \
+  --num-interests 8 \
+  --num-hard-neg 0 \
+  --num-random-neg 100 \
+  --sem-weight 0.10 \
+  --dis-weight 0 \
+  --div-weight 0
+```
+
+#### V2: Binary Evidence
+
+```bash
+/voice/bin/python scripts/train_qsdrec.py \
+  --model-variant qsdrec \
+  --dataset-dir runs/office \
+  --semantic-ids runs/office/semantic_ids_rq.json \
+  --output-dir runs/office/exp_evi_binary_f020_k8_sem010 \
+  --device cuda \
+  --epochs 100 \
+  --early-stop-patience 10 \
+  --batch-size 256 \
+  --max-len 50 \
+  --dim 128 \
+  --num-interests 8 \
+  --num-hard-neg 0 \
+  --num-random-neg 100 \
+  --sem-weight 0.10 \
+  --dis-weight 0 \
+  --div-weight 0 \
+  --evidence-gate history_overlap \
+  --evidence-floor 0.20
+```
+
+#### V5: CR-SID Item-frequency Residual
+
+```bash
+/voice/bin/python scripts/train_crsid.py \
+  --dataset-dir runs/office \
+  --semantic-ids runs/office/semantic_ids_rq.json \
+  --output-dir runs/office/crsid_itemfreq_tau20_s10 \
+  --device cuda \
+  --epochs 100 \
+  --early-stop-patience 10 \
+  --batch-size 256 \
+  --max-len 50 \
+  --dim 128 \
+  --num-hard-neg 0 \
+  --num-random-neg 100 \
+  --cr-tail-tau 20 \
+  --cr-residual-scale 1.0
+```
+
+#### V6: CR-SID Semantic-hub Residual
+
+```bash
+/voice/bin/python scripts/train_crsid_semhub.py \
+  --dataset-dir runs/office \
+  --semantic-ids runs/office/semantic_ids_rq.json \
+  --output-dir runs/office/crsid_semhub_f005_g10_s10 \
+  --device cuda \
+  --epochs 100 \
+  --early-stop-patience 10 \
+  --batch-size 256 \
+  --max-len 50 \
+  --dim 128 \
+  --num-hard-neg 0 \
+  --num-random-neg 100 \
+  --cr-hub-alpha-floor 0.05 \
+  --cr-hub-alpha-gamma 1.0 \
+  --cr-residual-scale 1.0
+```
+
+Semantic-hub 版本第一轮建议只改：
+
+```text
+crsid_semhub_f005_g10_s10
+crsid_semhub_f010_g10_s10
+crsid_semhub_f005_g05_s10
+crsid_semhub_f005_g20_s10
+crsid_semhub_f005_g10_s05
+crsid_semhub_f005_g10_s20
 ```
 
 ## 4. 结果分析流程
