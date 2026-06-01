@@ -6,8 +6,12 @@ from typing import Any, Dict, List
 
 
 DEFAULT_FIELDS = [
+    "model_variant",
     "sem_weight",
     "num_interests",
+    "cr_tail_tau",
+    "cr_residual_scale",
+    "cr_residual_reg",
     "dis_weight",
     "div_weight",
     "num_hard_neg",
@@ -73,6 +77,7 @@ def print_table(rows: List[Dict[str, Any]], metric: str, top_k: int) -> None:
     fields = [
         "rank",
         "exp",
+        "model_variant",
         "NDCG@10",
         "HR@10",
         "NDCG@20",
@@ -80,6 +85,8 @@ def print_table(rows: List[Dict[str, Any]], metric: str, top_k: int) -> None:
         "best_valid_NDCG@10",
         "sem_weight",
         "num_interests",
+        "cr_tail_tau",
+        "cr_residual_scale",
         "dis_weight",
         "div_weight",
         "num_hard_neg",

@@ -93,6 +93,145 @@ class SASRecEncoder(nn.Module):
         return last, h
 
 
+class SASRecDynamicEncoder(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        max_len: int,
+        num_heads: int = 2,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.pos_emb = nn.Embedding(max_len + 1, dim, padding_idx=0)
+        self.dropout = nn.Dropout(dropout)
+        self.max_len = max_len
+        self.dim = dim
+        self.attention_layernorms = nn.ModuleList()
+        self.attention_layers = nn.ModuleList()
+        self.forward_layernorms = nn.ModuleList()
+        self.forward_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.attention_layernorms.append(nn.LayerNorm(dim, eps=1e-8))
+            self.attention_layers.append(
+                nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=False)
+            )
+            self.forward_layernorms.append(nn.LayerNorm(dim, eps=1e-8))
+            self.forward_layers.append(PointWiseFeedForward(dim, dropout))
+        self.norm = nn.LayerNorm(dim, eps=1e-8)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for param in self.parameters():
+            if param.dim() > 1:
+                nn.init.xavier_normal_(param)
+        with torch.no_grad():
+            self.pos_emb.weight[0].fill_(0)
+
+    def forward(self, seq: torch.Tensor, item_repr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch, length = seq.shape
+        pos = torch.arange(1, length + 1, device=seq.device).unsqueeze(0).expand(batch, -1)
+        pos = pos * seq.ne(0).long()
+        x = item_repr * math.sqrt(self.dim)
+        x = x + self.pos_emb(pos)
+        x = self.dropout(x)
+        causal_mask = torch.triu(
+            torch.ones(length, length, dtype=torch.bool, device=seq.device),
+            diagonal=1,
+        )
+        h = x
+        for attn_norm, attn, ffn_norm, ffn in zip(
+            self.attention_layernorms,
+            self.attention_layers,
+            self.forward_layernorms,
+            self.forward_layers,
+        ):
+            h_t = h.transpose(0, 1)
+            q = attn_norm(h_t)
+            attn_out, _ = attn(q, q, q, attn_mask=causal_mask)
+            h = (h_t + attn_out).transpose(0, 1)
+            h = h + ffn(ffn_norm(h))
+            h = h * seq.ne(0).unsqueeze(-1)
+        h = self.norm(h)
+        return h[:, -1], h
+
+
+class CRSIDRec(nn.Module):
+    def __init__(
+        self,
+        num_items: int,
+        num_semantic_tokens: int,
+        semantic_id_table: torch.Tensor,
+        item_frequency: torch.Tensor,
+        dim: int = 64,
+        max_len: int = 50,
+        num_heads: int = 2,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        tail_tau: float = 20.0,
+        residual_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.encoder = SASRecDynamicEncoder(dim, max_len, num_heads, num_layers, dropout)
+        self.register_buffer("semantic_id_table", semantic_id_table.long())
+        freq = item_frequency.float().clamp_min(0.0)
+        alpha = freq / (freq + float(tail_tau))
+        alpha[0] = 0.0
+        self.register_buffer("item_residual_alpha", alpha.clamp(0.0, 1.0))
+        self.semantic_basis_emb = nn.Embedding(num_semantic_tokens + 1, dim, padding_idx=0)
+        self.semantic_residual_emb = nn.Embedding(num_semantic_tokens + 1, dim, padding_idx=0)
+        self.item_residual_emb = nn.Embedding(num_items + 1, dim, padding_idx=0)
+        self.basis_proj = nn.Linear(dim, dim)
+        self.out_norm = nn.LayerNorm(dim, eps=1e-8)
+        self.dropout = nn.Dropout(dropout)
+        self.residual_scale = residual_scale
+        self.dim = dim
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for param in self.parameters():
+            if param.dim() > 1:
+                nn.init.xavier_normal_(param)
+        with torch.no_grad():
+            self.semantic_basis_emb.weight[0].fill_(0)
+            self.semantic_residual_emb.weight[0].fill_(0)
+            self.item_residual_emb.weight[0].fill_(0)
+
+    def semantic_pool(self, token_emb: nn.Embedding, items: torch.Tensor) -> torch.Tensor:
+        sid = self.semantic_id_table[items]
+        tok = token_emb(sid)
+        mask = sid.ne(0).float().unsqueeze(-1)
+        return (tok * mask).sum(dim=-2) / mask.sum(dim=-2).clamp_min(1.0)
+
+    def item_representation(self, items: torch.Tensor) -> torch.Tensor:
+        basis = self.basis_proj(self.semantic_pool(self.semantic_basis_emb, items))
+        shared_residual = self.semantic_pool(self.semantic_residual_emb, items)
+        private_residual = self.item_residual_emb(items)
+        alpha = self.item_residual_alpha[items].unsqueeze(-1)
+        residual = alpha * private_residual + (1.0 - alpha) * shared_residual
+        out = self.out_norm(basis + self.residual_scale * residual)
+        return self.dropout(out) * items.ne(0).unsqueeze(-1)
+
+    def forward(self, seq: torch.Tensor, candidates: torch.Tensor, sem_weight: float = 1.0) -> Dict[str, torch.Tensor]:
+        seq_repr = self.item_representation(seq)
+        h_id, _ = self.encoder(seq, seq_repr)
+        cand_repr = self.item_representation(candidates)
+        score = torch.einsum("bd,bcd->bc", h_id, cand_repr)
+        residual_l2 = self.item_residual_emb(candidates).pow(2).mean()
+        return {
+            "score": score,
+            "id_score": score,
+            "sem_score": torch.zeros_like(score),
+            "amateur_sem_score": torch.zeros_like(score),
+            "hub_loss": score.new_tensor(0.0),
+            "residual_l2": residual_l2,
+        }
+
+    @staticmethod
+    def diversity_loss(queries: torch.Tensor) -> torch.Tensor:
+        return queries.new_tensor(0.0)
+
+
 class QSDRec(nn.Module):
     def __init__(
         self,

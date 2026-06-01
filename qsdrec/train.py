@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .io_utils import read_json, write_json
-from .model import QSDRec
+from .model import CRSIDRec, QSDRec
 
 
 class NextItemDataset(Dataset):
@@ -187,6 +187,15 @@ def load_mini_cluster_table(
     return table, build_log_prior(table, num_tokens)
 
 
+def build_train_item_frequency(sequences: List[Dict], num_items: int) -> torch.Tensor:
+    freq = torch.zeros(num_items + 1, dtype=torch.float)
+    for row in sequences:
+        for item in row["items"][:-2]:
+            if 0 < int(item) <= num_items:
+                freq[int(item)] += 1.0
+    return freq
+
+
 def cross_entropy_first_positive(scores: torch.Tensor) -> torch.Tensor:
     labels = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
     return torch.nn.functional.cross_entropy(scores, labels)
@@ -294,6 +303,7 @@ def train(args) -> None:
     semantic_obj = read_json(args.semantic_ids)
     num_items = int(stats["num_items"])
     semantic_table, item_semantic_ids, num_semantic_tokens = build_semantic_table(semantic_obj, num_items)
+    item_frequency = build_train_item_frequency(sequences, num_items)
     semantic_token_hubness, semantic_item_hubness = build_semantic_hubness(semantic_table, num_semantic_tokens)
     semantic_token_log_prior = build_log_prior(semantic_table, num_semantic_tokens)
     mini_cluster_table, mini_cluster_log_prior = load_mini_cluster_table(
@@ -337,38 +347,53 @@ def train(args) -> None:
     )
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    model = QSDRec(
-        num_items=num_items,
-        num_semantic_tokens=num_semantic_tokens,
-        semantic_id_table=semantic_table,
-        dim=args.dim,
-        max_len=args.max_len,
-        num_interests=args.num_interests,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        interest_router=args.interest_router,
-        prefix_level=args.prefix_level,
-        semantic_token_hubness=semantic_token_hubness,
-        semantic_item_hubness=semantic_item_hubness,
-        semantic_token_log_prior=semantic_token_log_prior,
-        mini_cluster_table=mini_cluster_table,
-        mini_cluster_log_prior=mini_cluster_log_prior,
-        hub_score_weight=args.hub_score_weight,
-        hub_attn_weight=args.hub_attn_weight,
-        evidence_gate=args.evidence_gate,
-        evidence_floor=args.evidence_floor,
-        evidence_recency_weight=args.evidence_recency_weight,
-        evidence_hub_weight=args.evidence_hub_weight,
-        evidence_cross_weight=args.evidence_cross_weight,
-        prior_lift_alpha=args.prior_lift_alpha,
-        prior_lift_tau=args.prior_lift_tau,
-        prior_lift_eta=args.prior_lift_eta,
-        hub_penalty_weight=args.hub_penalty_weight,
-        semantic_fusion=args.semantic_fusion,
-        fusion_floor=args.fusion_floor,
-        contrastive_alpha=args.contrastive_alpha,
-    ).to(device)
+    if args.model_variant == "crsid":
+        model = CRSIDRec(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            semantic_id_table=semantic_table,
+            item_frequency=item_frequency,
+            dim=args.dim,
+            max_len=args.max_len,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            tail_tau=args.cr_tail_tau,
+            residual_scale=args.cr_residual_scale,
+        ).to(device)
+    else:
+        model = QSDRec(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            semantic_id_table=semantic_table,
+            dim=args.dim,
+            max_len=args.max_len,
+            num_interests=args.num_interests,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            interest_router=args.interest_router,
+            prefix_level=args.prefix_level,
+            semantic_token_hubness=semantic_token_hubness,
+            semantic_item_hubness=semantic_item_hubness,
+            semantic_token_log_prior=semantic_token_log_prior,
+            mini_cluster_table=mini_cluster_table,
+            mini_cluster_log_prior=mini_cluster_log_prior,
+            hub_score_weight=args.hub_score_weight,
+            hub_attn_weight=args.hub_attn_weight,
+            evidence_gate=args.evidence_gate,
+            evidence_floor=args.evidence_floor,
+            evidence_recency_weight=args.evidence_recency_weight,
+            evidence_hub_weight=args.evidence_hub_weight,
+            evidence_cross_weight=args.evidence_cross_weight,
+            prior_lift_alpha=args.prior_lift_alpha,
+            prior_lift_tau=args.prior_lift_tau,
+            prior_lift_eta=args.prior_lift_eta,
+            hub_penalty_weight=args.hub_penalty_weight,
+            semantic_fusion=args.semantic_fusion,
+            fusion_floor=args.fusion_floor,
+            contrastive_alpha=args.contrastive_alpha,
+        ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_metric = -1.0
@@ -391,7 +416,7 @@ def train(args) -> None:
                     sem_weight=args.sem_weight,
                     candidate_chunk_size=args.train_candidate_chunk_size,
                 )
-                if args.div_weight > 0:
+                if args.model_variant == "qsdrec" and args.div_weight > 0:
                     h_id, _ = model.encoder(seq)
                     queries = model.user_queries(seq, h_id)
                     loss = loss + args.div_weight * model.diversity_loss(queries)
@@ -399,14 +424,17 @@ def train(args) -> None:
                 candidates = candidates.to(device)
                 out = model(seq, candidates, sem_weight=args.sem_weight)
                 rec_loss = cross_entropy_first_positive(out["score"])
-                dis_loss = cross_entropy_first_positive(out["sem_score"])
-                div_loss = model.diversity_loss(out["queries"])
-                loss = (
-                    rec_loss
-                    + args.dis_weight * dis_loss
-                    + args.div_weight * div_loss
-                    + args.hub_loss_weight * out["hub_loss"]
-                )
+                if args.model_variant == "crsid":
+                    loss = rec_loss + args.cr_residual_reg * out["residual_l2"]
+                else:
+                    dis_loss = cross_entropy_first_positive(out["sem_score"])
+                    div_loss = model.diversity_loss(out["queries"])
+                    loss = (
+                        rec_loss
+                        + args.dis_weight * dis_loss
+                        + args.div_weight * div_loss
+                        + args.hub_loss_weight * out["hub_loss"]
+                    )
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -467,6 +495,7 @@ def train(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model-variant", choices=["qsdrec", "crsid"], default="qsdrec")
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--semantic-ids", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -508,6 +537,9 @@ def main() -> None:
     parser.add_argument("--semantic-fusion", choices=["fixed", "evidence_coverage"], default="fixed")
     parser.add_argument("--fusion-floor", type=float, default=0.0)
     parser.add_argument("--contrastive-alpha", type=float, default=0.0)
+    parser.add_argument("--cr-tail-tau", type=float, default=20.0)
+    parser.add_argument("--cr-residual-scale", type=float, default=1.0)
+    parser.add_argument("--cr-residual-reg", type=float, default=0.0)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)
