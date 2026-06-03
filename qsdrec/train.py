@@ -364,6 +364,10 @@ def train(args) -> None:
             semantic_token_hubness=semantic_token_hubness,
             hub_alpha_floor=args.cr_hub_alpha_floor,
             hub_alpha_gamma=args.cr_hub_alpha_gamma,
+            disable_semantic_basis=args.cr_disable_semantic_basis,
+            disable_shared_residual=args.cr_disable_shared_residual,
+            disable_private_residual=args.cr_disable_private_residual,
+            alpha_override=args.cr_alpha_override,
         ).to(device)
     else:
         model = QSDRec(
@@ -546,6 +550,10 @@ def main() -> None:
     parser.add_argument("--cr-residual-reg", type=float, default=0.0)
     parser.add_argument("--cr-hub-alpha-floor", type=float, default=0.05)
     parser.add_argument("--cr-hub-alpha-gamma", type=float, default=1.0)
+    parser.add_argument("--cr-disable-semantic-basis", action="store_true")
+    parser.add_argument("--cr-disable-shared-residual", action="store_true")
+    parser.add_argument("--cr-disable-private-residual", action="store_true")
+    parser.add_argument("--cr-alpha-override", type=float, default=None)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)

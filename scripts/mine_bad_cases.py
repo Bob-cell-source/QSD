@@ -11,8 +11,16 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qsdrec.io_utils import read_json, write_json
-from qsdrec.model import QSDRec
-from qsdrec.train import NextItemDataset, build_log_prior, build_semantic_table, collate_full_eval, load_mini_cluster_table
+from qsdrec.model import CRSIDRec, QSDRec
+from qsdrec.train import (
+    NextItemDataset,
+    build_log_prior,
+    build_semantic_hubness,
+    build_semantic_table,
+    build_train_item_frequency,
+    collate_full_eval,
+    load_mini_cluster_table,
+)
 
 
 def load_model(checkpoint: Path, cli_args, device: torch.device):
@@ -24,9 +32,12 @@ def load_model(checkpoint: Path, cli_args, device: torch.device):
         cfg["semantic_ids"] = cli_args.semantic_ids
 
     stats = read_json(Path(cfg["dataset_dir"]) / "stats.json")
+    sequences = read_json(Path(cfg["dataset_dir"]) / "sequences.json")
     semantic_obj = read_json(cfg["semantic_ids"])
     num_items = int(stats["num_items"])
     semantic_table, item_semantic_ids, num_semantic_tokens = build_semantic_table(semantic_obj, num_items)
+    item_frequency = build_train_item_frequency(sequences, num_items)
+    semantic_token_hubness, _ = build_semantic_hubness(semantic_table, num_semantic_tokens)
     semantic_token_log_prior = build_log_prior(semantic_table, num_semantic_tokens)
     mini_cluster_table, mini_cluster_log_prior = load_mini_cluster_table(
         cfg.get("mini_clusters"),
@@ -34,36 +45,56 @@ def load_model(checkpoint: Path, cli_args, device: torch.device):
         semantic_table,
     )
 
-    model = QSDRec(
-        num_items=num_items,
-        num_semantic_tokens=num_semantic_tokens,
-        semantic_id_table=semantic_table,
-        dim=int(cfg.get("dim", 64)),
-        max_len=int(cfg.get("max_len", 50)),
-        num_interests=int(cfg.get("num_interests", 4)),
-        num_heads=int(cfg.get("num_heads", 2)),
-        num_layers=int(cfg.get("num_layers", 2)),
-        dropout=float(cfg.get("dropout", 0.2)),
-        interest_router=str(cfg.get("interest_router", "semantic")),
-        prefix_level=int(cfg.get("prefix_level", 2)),
-        semantic_token_log_prior=semantic_token_log_prior,
-        mini_cluster_table=mini_cluster_table,
-        mini_cluster_log_prior=mini_cluster_log_prior,
-        hub_score_weight=float(cfg.get("hub_score_weight", 0.0)),
-        hub_attn_weight=float(cfg.get("hub_attn_weight", 0.0)),
-        evidence_gate=str(cfg.get("evidence_gate", "none")),
-        evidence_floor=float(cfg.get("evidence_floor", 0.1)),
-        evidence_recency_weight=float(cfg.get("evidence_recency_weight", 0.0)),
-        evidence_hub_weight=float(cfg.get("evidence_hub_weight", 0.0)),
-        evidence_cross_weight=float(cfg.get("evidence_cross_weight", 0.2)),
-        prior_lift_alpha=float(cfg.get("prior_lift_alpha", 0.1)),
-        prior_lift_tau=float(cfg.get("prior_lift_tau", 1.0)),
-        prior_lift_eta=float(cfg.get("prior_lift_eta", 1.0)),
-        hub_penalty_weight=float(cfg.get("hub_penalty_weight", 0.0)),
-        semantic_fusion=str(cfg.get("semantic_fusion", "fixed")),
-        fusion_floor=float(cfg.get("fusion_floor", 0.0)),
-        contrastive_alpha=float(cfg.get("contrastive_alpha", 0.0)),
-    )
+    variant = str(cfg.get("model_variant", "qsdrec"))
+    if variant in {"crsid", "crsid_semhub"}:
+        model = CRSIDRec(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            semantic_id_table=semantic_table,
+            item_frequency=item_frequency,
+            dim=int(cfg.get("dim", 64)),
+            max_len=int(cfg.get("max_len", 50)),
+            num_heads=int(cfg.get("num_heads", 2)),
+            num_layers=int(cfg.get("num_layers", 2)),
+            dropout=float(cfg.get("dropout", 0.2)),
+            tail_tau=float(cfg.get("cr_tail_tau", 20.0)),
+            residual_scale=float(cfg.get("cr_residual_scale", 1.0)),
+            alpha_mode="semantic_hubness" if variant == "crsid_semhub" else "item_frequency",
+            semantic_token_hubness=semantic_token_hubness,
+            hub_alpha_floor=float(cfg.get("cr_hub_alpha_floor", 0.05)),
+            hub_alpha_gamma=float(cfg.get("cr_hub_alpha_gamma", 1.0)),
+        )
+    else:
+        model = QSDRec(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            semantic_id_table=semantic_table,
+            dim=int(cfg.get("dim", 64)),
+            max_len=int(cfg.get("max_len", 50)),
+            num_interests=int(cfg.get("num_interests", 4)),
+            num_heads=int(cfg.get("num_heads", 2)),
+            num_layers=int(cfg.get("num_layers", 2)),
+            dropout=float(cfg.get("dropout", 0.2)),
+            interest_router=str(cfg.get("interest_router", "semantic")),
+            prefix_level=int(cfg.get("prefix_level", 2)),
+            semantic_token_log_prior=semantic_token_log_prior,
+            mini_cluster_table=mini_cluster_table,
+            mini_cluster_log_prior=mini_cluster_log_prior,
+            hub_score_weight=float(cfg.get("hub_score_weight", 0.0)),
+            hub_attn_weight=float(cfg.get("hub_attn_weight", 0.0)),
+            evidence_gate=str(cfg.get("evidence_gate", "none")),
+            evidence_floor=float(cfg.get("evidence_floor", 0.1)),
+            evidence_recency_weight=float(cfg.get("evidence_recency_weight", 0.0)),
+            evidence_hub_weight=float(cfg.get("evidence_hub_weight", 0.0)),
+            evidence_cross_weight=float(cfg.get("evidence_cross_weight", 0.2)),
+            prior_lift_alpha=float(cfg.get("prior_lift_alpha", 0.1)),
+            prior_lift_tau=float(cfg.get("prior_lift_tau", 1.0)),
+            prior_lift_eta=float(cfg.get("prior_lift_eta", 1.0)),
+            hub_penalty_weight=float(cfg.get("hub_penalty_weight", 0.0)),
+            semantic_fusion=str(cfg.get("semantic_fusion", "fixed")),
+            fusion_floor=float(cfg.get("fusion_floor", 0.0)),
+            contrastive_alpha=float(cfg.get("contrastive_alpha", 0.0)),
+        )
     model.load_state_dict(state["model"], strict=False)
     model.to(device)
     model.eval()

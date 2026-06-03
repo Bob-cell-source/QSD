@@ -174,6 +174,10 @@ class CRSIDRec(nn.Module):
         semantic_token_hubness: torch.Tensor | None = None,
         hub_alpha_floor: float = 0.05,
         hub_alpha_gamma: float = 1.0,
+        disable_semantic_basis: bool = False,
+        disable_shared_residual: bool = False,
+        disable_private_residual: bool = False,
+        alpha_override: float | None = None,
     ) -> None:
         super().__init__()
         if alpha_mode not in {"item_frequency", "semantic_hubness"}:
@@ -197,6 +201,10 @@ class CRSIDRec(nn.Module):
         self.alpha_mode = alpha_mode
         self.hub_alpha_floor = hub_alpha_floor
         self.hub_alpha_gamma = hub_alpha_gamma
+        self.disable_semantic_basis = disable_semantic_basis
+        self.disable_shared_residual = disable_shared_residual
+        self.disable_private_residual = disable_private_residual
+        self.alpha_override = alpha_override
         self.dim = dim
         self._init_weights()
 
@@ -216,6 +224,10 @@ class CRSIDRec(nn.Module):
         return (tok * mask).sum(dim=-2) / mask.sum(dim=-2).clamp_min(1.0)
 
     def residual_alpha(self, items: torch.Tensor) -> torch.Tensor:
+        if self.alpha_override is not None:
+            alpha = items.new_full(items.shape, float(self.alpha_override), dtype=torch.float)
+            return alpha.clamp(0.0, 1.0).unsqueeze(-1)
+
         if self.alpha_mode == "item_frequency":
             return self.item_residual_alpha[items].unsqueeze(-1)
 
@@ -229,9 +241,21 @@ class CRSIDRec(nn.Module):
         return alpha.clamp(0.0, 1.0).unsqueeze(-1)
 
     def item_representation(self, items: torch.Tensor) -> torch.Tensor:
-        basis = self.basis_proj(self.semantic_pool(self.semantic_basis_emb, items))
-        shared_residual = self.semantic_pool(self.semantic_residual_emb, items)
-        private_residual = self.item_residual_emb(items)
+        if self.disable_semantic_basis:
+            basis = items.new_zeros((*items.shape, self.dim), dtype=torch.float)
+        else:
+            basis = self.basis_proj(self.semantic_pool(self.semantic_basis_emb, items))
+
+        if self.disable_shared_residual:
+            shared_residual = items.new_zeros((*items.shape, self.dim), dtype=torch.float)
+        else:
+            shared_residual = self.semantic_pool(self.semantic_residual_emb, items)
+
+        if self.disable_private_residual:
+            private_residual = items.new_zeros((*items.shape, self.dim), dtype=torch.float)
+        else:
+            private_residual = self.item_residual_emb(items)
+
         alpha = self.residual_alpha(items)
         residual = alpha * private_residual + (1.0 - alpha) * shared_residual
         out = self.out_norm(basis + self.residual_scale * residual)
