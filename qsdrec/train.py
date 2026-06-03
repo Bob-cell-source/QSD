@@ -152,6 +152,75 @@ def build_semantic_hubness(semantic_table: torch.Tensor, num_semantic_tokens: in
     return token_hub, item_hub
 
 
+def build_soft_semantic_table(
+    semantic_table: torch.Tensor,
+    item_semantic_ids: Dict[int, List[int]],
+    num_items: int,
+    top_m: int,
+    min_overlap_slots: int,
+    min_support: float,
+    support_eta: float,
+    hard_token_prior: float,
+    reliability_floor: float,
+    max_neighbors: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    depth = semantic_table.size(1)
+    top_m = max(int(top_m), 1)
+    inverted: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for item, sid in item_semantic_ids.items():
+        for slot, code in enumerate(sid):
+            inverted[(slot, int(code))].append(item)
+
+    soft_ids = torch.zeros(num_items + 1, depth, top_m, dtype=torch.long)
+    soft_weights = torch.zeros(num_items + 1, depth, top_m, dtype=torch.float)
+    reliability = torch.zeros(num_items + 1, dtype=torch.float)
+
+    for item in range(1, num_items + 1):
+        sid = item_semantic_ids[item]
+        overlap_counts: Counter[int] = Counter()
+        for slot, code in enumerate(sid):
+            overlap_counts.update(inverted[(slot, int(code))])
+        neighbors = [
+            (neighbor, count)
+            for neighbor, count in overlap_counts.items()
+            if neighbor != item and count >= min_overlap_slots
+        ]
+        neighbors.sort(key=lambda row: row[1], reverse=True)
+        if max_neighbors > 0:
+            neighbors = neighbors[:max_neighbors]
+        neighbor_items = [neighbor for neighbor, _ in neighbors]
+        denom = max(len(neighbor_items), 1)
+
+        item_reliability = 0.0
+        for slot in range(depth):
+            hard_token = int(semantic_table[item, slot].item())
+            counts: Counter[int] = Counter(int(semantic_table[n, slot].item()) for n in neighbor_items)
+            candidates = {
+                token: count
+                for token, count in counts.items()
+                if token > 0 and (count / denom) >= min_support
+            }
+            candidates[hard_token] = candidates.get(hard_token, 0) + max(1.0, hard_token_prior * denom)
+
+            ranked = sorted(candidates.items(), key=lambda row: (row[1], row[0] == hard_token), reverse=True)[:top_m]
+            scores = torch.tensor(
+                [max(float(count), 1e-6) ** support_eta for _, count in ranked],
+                dtype=torch.float,
+            )
+            weights = scores / scores.sum().clamp_min(1e-6)
+            slot_support = 0.0
+            for idx, ((token, _), weight) in enumerate(zip(ranked, weights.tolist())):
+                soft_ids[item, slot, idx] = int(token)
+                soft_weights[item, slot, idx] = float(weight)
+                slot_support += float(weight) * (counts.get(int(token), 0) / denom)
+            item_reliability += slot_support
+
+        reliability[item] = max(float(reliability_floor), item_reliability / max(depth, 1))
+
+    reliability[0] = 0.0
+    return soft_ids, soft_weights, reliability.clamp(0.0, 1.0)
+
+
 def build_log_prior(table: torch.Tensor, num_tokens: int, alpha: float = 1.0) -> torch.Tensor:
     token_counts = torch.zeros(num_tokens + 1, dtype=torch.float)
     item_sids = table[1:]
@@ -305,6 +374,22 @@ def train(args) -> None:
     semantic_table, item_semantic_ids, num_semantic_tokens = build_semantic_table(semantic_obj, num_items)
     item_frequency = build_train_item_frequency(sequences, num_items)
     semantic_token_hubness, semantic_item_hubness = build_semantic_hubness(semantic_table, num_semantic_tokens)
+    soft_semantic_table = None
+    soft_semantic_weight = None
+    semantic_reliability = None
+    if args.model_variant == "crsid_soft":
+        soft_semantic_table, soft_semantic_weight, semantic_reliability = build_soft_semantic_table(
+            semantic_table=semantic_table,
+            item_semantic_ids=item_semantic_ids,
+            num_items=num_items,
+            top_m=args.cr_soft_top_m,
+            min_overlap_slots=args.cr_soft_min_overlap_slots,
+            min_support=args.cr_soft_min_support,
+            support_eta=args.cr_soft_support_eta,
+            hard_token_prior=args.cr_soft_hard_token_prior,
+            reliability_floor=args.cr_soft_reliability_floor,
+            max_neighbors=args.cr_soft_max_neighbors,
+        )
     semantic_token_log_prior = build_log_prior(semantic_table, num_semantic_tokens)
     mini_cluster_table, mini_cluster_log_prior = load_mini_cluster_table(
         args.mini_clusters,
@@ -347,12 +432,15 @@ def train(args) -> None:
     )
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    if args.model_variant in {"crsid", "crsid_semhub"}:
+    if args.model_variant in {"crsid", "crsid_semhub", "crsid_soft"}:
         model = CRSIDRec(
             num_items=num_items,
             num_semantic_tokens=num_semantic_tokens,
             semantic_id_table=semantic_table,
             item_frequency=item_frequency,
+            soft_semantic_id_table=soft_semantic_table,
+            soft_semantic_id_weight=soft_semantic_weight,
+            semantic_reliability=semantic_reliability,
             dim=args.dim,
             max_len=args.max_len,
             num_heads=args.num_heads,
@@ -432,7 +520,7 @@ def train(args) -> None:
                 candidates = candidates.to(device)
                 out = model(seq, candidates, sem_weight=args.sem_weight)
                 rec_loss = cross_entropy_first_positive(out["score"])
-                if args.model_variant in {"crsid", "crsid_semhub"}:
+                if args.model_variant in {"crsid", "crsid_semhub", "crsid_soft"}:
                     loss = rec_loss + args.cr_residual_reg * out["residual_l2"]
                 else:
                     dis_loss = cross_entropy_first_positive(out["sem_score"])
@@ -503,7 +591,7 @@ def train(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-variant", choices=["qsdrec", "crsid", "crsid_semhub"], default="qsdrec")
+    parser.add_argument("--model-variant", choices=["qsdrec", "crsid", "crsid_semhub", "crsid_soft"], default="qsdrec")
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--semantic-ids", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -554,6 +642,13 @@ def main() -> None:
     parser.add_argument("--cr-disable-shared-residual", action="store_true")
     parser.add_argument("--cr-disable-private-residual", action="store_true")
     parser.add_argument("--cr-alpha-override", type=float, default=None)
+    parser.add_argument("--cr-soft-top-m", type=int, default=4)
+    parser.add_argument("--cr-soft-min-overlap-slots", type=int, default=2)
+    parser.add_argument("--cr-soft-min-support", type=float, default=0.05)
+    parser.add_argument("--cr-soft-support-eta", type=float, default=1.0)
+    parser.add_argument("--cr-soft-hard-token-prior", type=float, default=1.0)
+    parser.add_argument("--cr-soft-reliability-floor", type=float, default=0.10)
+    parser.add_argument("--cr-soft-max-neighbors", type=int, default=50)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)

@@ -163,6 +163,9 @@ class CRSIDRec(nn.Module):
         num_semantic_tokens: int,
         semantic_id_table: torch.Tensor,
         item_frequency: torch.Tensor,
+        soft_semantic_id_table: torch.Tensor | None = None,
+        soft_semantic_id_weight: torch.Tensor | None = None,
+        semantic_reliability: torch.Tensor | None = None,
         dim: int = 64,
         max_len: int = 50,
         num_heads: int = 2,
@@ -184,11 +187,26 @@ class CRSIDRec(nn.Module):
             raise ValueError(f"Unsupported alpha_mode: {alpha_mode}")
         self.encoder = SASRecDynamicEncoder(dim, max_len, num_heads, num_layers, dropout)
         self.register_buffer("semantic_id_table", semantic_id_table.long())
+        if soft_semantic_id_table is not None and soft_semantic_id_weight is not None:
+            if soft_semantic_id_table.shape != soft_semantic_id_weight.shape:
+                raise ValueError("soft_semantic_id_table and soft_semantic_id_weight must have the same shape.")
+            self.register_buffer("soft_semantic_id_table", soft_semantic_id_table.long())
+            self.register_buffer("soft_semantic_id_weight", soft_semantic_id_weight.float())
+            self.use_soft_semantic_ids = True
+        else:
+            self.register_buffer("soft_semantic_id_table", torch.zeros(1, 1, 1, dtype=torch.long))
+            self.register_buffer("soft_semantic_id_weight", torch.zeros(1, 1, 1, dtype=torch.float))
+            self.use_soft_semantic_ids = False
+        if semantic_reliability is None:
+            semantic_reliability = torch.ones_like(item_frequency, dtype=torch.float)
+            semantic_reliability[0] = 0.0
+        self.register_buffer("semantic_reliability", semantic_reliability.float().clamp(0.0, 1.0))
         if semantic_token_hubness is None:
             semantic_token_hubness = torch.zeros(num_semantic_tokens + 1, dtype=torch.float)
         self.register_buffer("semantic_token_hubness", semantic_token_hubness.float())
         freq = item_frequency.float().clamp_min(0.0)
-        alpha = freq / (freq + float(tail_tau))
+        tau = float(tail_tau) * self.semantic_reliability.clamp_min(1e-6)
+        alpha = freq / (freq + tau)
         alpha[0] = 0.0
         self.register_buffer("item_residual_alpha", alpha.clamp(0.0, 1.0))
         self.semantic_basis_emb = nn.Embedding(num_semantic_tokens + 1, dim, padding_idx=0)
@@ -218,6 +236,15 @@ class CRSIDRec(nn.Module):
             self.item_residual_emb.weight[0].fill_(0)
 
     def semantic_pool(self, token_emb: nn.Embedding, items: torch.Tensor) -> torch.Tensor:
+        if self.use_soft_semantic_ids:
+            sid = self.soft_semantic_id_table[items]
+            weight = self.soft_semantic_id_weight[items].unsqueeze(-1)
+            tok = token_emb(sid)
+            pooled = (tok * weight).sum(dim=-2)
+            slot_weight = self.soft_semantic_id_weight[items].sum(dim=-1, keepdim=True)
+            slot_mask = slot_weight.gt(0).float()
+            return (pooled * slot_mask).sum(dim=-2) / slot_mask.sum(dim=-2).clamp_min(1.0)
+
         sid = self.semantic_id_table[items]
         tok = token_emb(sid)
         mask = sid.ne(0).float().unsqueeze(-1)
