@@ -64,7 +64,7 @@ LC-Soft CRSID 的核心思想是为每个物品构造一个局部一致的 soft 
 ```mermaid
 flowchart LR
     A[Item i] --> B[Hard Semantic ID z_i]
-    B --> C[Local Neighborhood N(i)]
+    B --> C["Local Neighborhood N(i)"]
     C --> D[Local Token Support]
     D --> E[Soft Candidate SID Z_i]
     E --> F[Semantic Basis b_i]

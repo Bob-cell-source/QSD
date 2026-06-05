@@ -181,10 +181,13 @@ class CRSIDRec(nn.Module):
         disable_shared_residual: bool = False,
         disable_private_residual: bool = False,
         alpha_override: float | None = None,
+        alpha_frequency_transform: Literal["raw", "log"] = "raw",
     ) -> None:
         super().__init__()
         if alpha_mode not in {"item_frequency", "semantic_hubness"}:
             raise ValueError(f"Unsupported alpha_mode: {alpha_mode}")
+        if alpha_frequency_transform not in {"raw", "log"}:
+            raise ValueError(f"Unsupported alpha_frequency_transform: {alpha_frequency_transform}")
         self.encoder = SASRecDynamicEncoder(dim, max_len, num_heads, num_layers, dropout)
         self.register_buffer("semantic_id_table", semantic_id_table.long())
         if soft_semantic_id_table is not None and soft_semantic_id_weight is not None:
@@ -205,6 +208,8 @@ class CRSIDRec(nn.Module):
             semantic_token_hubness = torch.zeros(num_semantic_tokens + 1, dtype=torch.float)
         self.register_buffer("semantic_token_hubness", semantic_token_hubness.float())
         freq = item_frequency.float().clamp_min(0.0)
+        if alpha_frequency_transform == "log":
+            freq = torch.log1p(freq)
         tau = float(tail_tau) * self.semantic_reliability.clamp_min(1e-6)
         alpha = freq / (freq + tau)
         alpha[0] = 0.0
@@ -223,6 +228,7 @@ class CRSIDRec(nn.Module):
         self.disable_shared_residual = disable_shared_residual
         self.disable_private_residual = disable_private_residual
         self.alpha_override = alpha_override
+        self.alpha_frequency_transform = alpha_frequency_transform
         self.dim = dim
         self._init_weights()
 

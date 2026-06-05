@@ -163,13 +163,32 @@ def build_soft_semantic_table(
     hard_token_prior: float,
     reliability_floor: float,
     max_neighbors: int,
+    lift_kappa: float = 0.0,
+    lift_clip: float = 5.0,
+    lift_eps: float = 1e-6,
+    decouple_reliability: bool = False,
+    behavior_neighbors: Dict[int, List[int]] | None = None,
+    behavior_neighbor_weight: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     depth = semantic_table.size(1)
     top_m = max(int(top_m), 1)
     inverted: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    slot_token_counts: List[Counter[int]] = [Counter() for _ in range(depth)]
     for item, sid in item_semantic_ids.items():
         for slot, code in enumerate(sid):
-            inverted[(slot, int(code))].append(item)
+            token = int(code)
+            inverted[(slot, token)].append(item)
+            slot_token_counts[slot][token] += 1
+    global_denom = max(len(item_semantic_ids), 1)
+    lift_eps = max(float(lift_eps), 1e-12)
+    lift_clip = max(float(lift_clip), 0.0)
+
+    def local_lift(slot: int, token: int, support: float) -> float:
+        if lift_kappa == 0.0:
+            return 0.0
+        global_prob = slot_token_counts[slot].get(int(token), 0) / global_denom
+        lift = math.log((support + lift_eps) / (global_prob + lift_eps))
+        return min(max(lift, 0.0), lift_clip)
 
     soft_ids = torch.zeros(num_items + 1, depth, top_m, dtype=torch.long)
     soft_weights = torch.zeros(num_items + 1, depth, top_m, dtype=torch.float)
@@ -188,31 +207,64 @@ def build_soft_semantic_table(
         neighbors.sort(key=lambda row: row[1], reverse=True)
         if max_neighbors > 0:
             neighbors = neighbors[:max_neighbors]
-        neighbor_items = [neighbor for neighbor, _ in neighbors]
-        denom = max(len(neighbor_items), 1)
+        neighbor_weights: Dict[int, float] = {neighbor: 1.0 for neighbor, _ in neighbors}
+        if behavior_neighbors is not None and behavior_neighbor_weight > 0.0:
+            for neighbor in behavior_neighbors.get(item, []):
+                if neighbor == item:
+                    continue
+                neighbor_weights[neighbor] = neighbor_weights.get(neighbor, 0.0) + float(behavior_neighbor_weight)
+        denom = max(sum(neighbor_weights.values()), 1.0)
 
         item_reliability = 0.0
         for slot in range(depth):
             hard_token = int(semantic_table[item, slot].item())
-            counts: Counter[int] = Counter(int(semantic_table[n, slot].item()) for n in neighbor_items)
-            candidates = {
+            counts: Counter[int] = Counter()
+            for neighbor, weight in neighbor_weights.items():
+                counts[int(semantic_table[neighbor, slot].item())] += float(weight)
+            candidates: Dict[int, float] = {
                 token: count
                 for token, count in counts.items()
                 if token > 0 and (count / denom) >= min_support
             }
             candidates[hard_token] = candidates.get(hard_token, 0) + max(1.0, hard_token_prior * denom)
 
-            ranked = sorted(candidates.items(), key=lambda row: (row[1], row[0] == hard_token), reverse=True)[:top_m]
-            scores = torch.tensor(
-                [max(float(count), 1e-6) ** support_eta for _, count in ranked],
-                dtype=torch.float,
-            )
+            scored = []
+            for token, weight_count in candidates.items():
+                support = counts.get(int(token), 0) / denom
+                lift = local_lift(slot, int(token), support)
+                score = max(float(weight_count), 1e-6) ** support_eta
+                if lift_kappa != 0.0:
+                    score *= math.exp(float(lift_kappa) * lift)
+                scored.append((int(token), float(weight_count), float(score)))
+            ranked = sorted(scored, key=lambda row: (row[2], row[0] == hard_token), reverse=True)[:top_m]
+            scores = torch.tensor([score for _, _, score in ranked], dtype=torch.float)
             weights = scores / scores.sum().clamp_min(1e-6)
+
+            rel_weights = weights.tolist()
+            if decouple_reliability:
+                rel_scores = []
+                for token, _, _ in ranked:
+                    support = counts.get(int(token), 0) / denom
+                    if support <= 0.0:
+                        rel_scores.append(0.0)
+                        continue
+                    lift = local_lift(slot, int(token), support)
+                    rel_score = max(float(counts.get(int(token), 0)), 1e-6) ** support_eta
+                    if lift_kappa != 0.0:
+                        rel_score *= math.exp(float(lift_kappa) * lift)
+                    rel_scores.append(float(rel_score))
+                rel_total = sum(rel_scores)
+                if rel_total > 0.0:
+                    rel_weights = [score / rel_total for score in rel_scores]
+                else:
+                    rel_weights = [0.0 for _ in rel_scores]
+
             slot_support = 0.0
-            for idx, ((token, _), weight) in enumerate(zip(ranked, weights.tolist())):
+            for idx, ((token, _, _), weight) in enumerate(zip(ranked, weights.tolist())):
                 soft_ids[item, slot, idx] = int(token)
                 soft_weights[item, slot, idx] = float(weight)
-                slot_support += float(weight) * (counts.get(int(token), 0) / denom)
+            for (token, _, _), rel_weight in zip(ranked, rel_weights):
+                slot_support += float(rel_weight) * (counts.get(int(token), 0) / denom)
             item_reliability += slot_support
 
         reliability[item] = max(float(reliability_floor), item_reliability / max(depth, 1))
@@ -254,6 +306,42 @@ def load_mini_cluster_table(
             table[item] = torch.tensor(codes, dtype=torch.long)
             num_tokens = max(num_tokens, max(codes) if codes else 0)
     return table, build_log_prior(table, num_tokens)
+
+
+def build_behavior_neighbors(
+    sequences: List[Dict],
+    num_items: int,
+    window_size: int,
+    min_count: int,
+    max_neighbors: int,
+) -> Dict[int, List[int]]:
+    if window_size <= 0 or max_neighbors <= 0:
+        return {}
+
+    edge_counts: Dict[int, Counter[int]] = defaultdict(Counter)
+    for row in sequences:
+        items = [int(x) for x in row["items"][:-2] if 0 < int(x) <= num_items]
+        for idx, item in enumerate(items):
+            start = max(0, idx - window_size)
+            end = min(len(items), idx + window_size + 1)
+            for pos in range(start, end):
+                if pos == idx:
+                    continue
+                neighbor = items[pos]
+                if neighbor != item:
+                    edge_counts[item][neighbor] += 1
+
+    neighbors: Dict[int, List[int]] = {}
+    min_count = max(int(min_count), 1)
+    for item, counts in edge_counts.items():
+        ranked = [
+            neighbor
+            for neighbor, count in sorted(counts.items(), key=lambda row: (row[1], row[0]), reverse=True)
+            if count >= min_count
+        ]
+        if ranked:
+            neighbors[item] = ranked[:max_neighbors]
+    return neighbors
 
 
 def build_train_item_frequency(sequences: List[Dict], num_items: int) -> torch.Tensor:
@@ -377,7 +465,16 @@ def train(args) -> None:
     soft_semantic_table = None
     soft_semantic_weight = None
     semantic_reliability = None
+    behavior_neighbors = None
     if args.model_variant == "crsid_soft":
+        if args.cr_soft_behavior_weight > 0.0:
+            behavior_neighbors = build_behavior_neighbors(
+                sequences=sequences,
+                num_items=num_items,
+                window_size=args.cr_soft_behavior_window,
+                min_count=args.cr_soft_behavior_min_count,
+                max_neighbors=args.cr_soft_max_behavior_neighbors,
+            )
         soft_semantic_table, soft_semantic_weight, semantic_reliability = build_soft_semantic_table(
             semantic_table=semantic_table,
             item_semantic_ids=item_semantic_ids,
@@ -389,6 +486,12 @@ def train(args) -> None:
             hard_token_prior=args.cr_soft_hard_token_prior,
             reliability_floor=args.cr_soft_reliability_floor,
             max_neighbors=args.cr_soft_max_neighbors,
+            lift_kappa=args.cr_soft_lift_kappa,
+            lift_clip=args.cr_soft_lift_clip,
+            lift_eps=args.cr_soft_lift_eps,
+            decouple_reliability=args.cr_soft_decouple_reliability,
+            behavior_neighbors=behavior_neighbors,
+            behavior_neighbor_weight=args.cr_soft_behavior_weight,
         )
     semantic_token_log_prior = build_log_prior(semantic_table, num_semantic_tokens)
     mini_cluster_table, mini_cluster_log_prior = load_mini_cluster_table(
@@ -456,6 +559,7 @@ def train(args) -> None:
             disable_shared_residual=args.cr_disable_shared_residual,
             disable_private_residual=args.cr_disable_private_residual,
             alpha_override=args.cr_alpha_override,
+            alpha_frequency_transform=args.cr_alpha_frequency_transform,
         ).to(device)
     else:
         model = QSDRec(
@@ -642,6 +746,7 @@ def main() -> None:
     parser.add_argument("--cr-disable-shared-residual", action="store_true")
     parser.add_argument("--cr-disable-private-residual", action="store_true")
     parser.add_argument("--cr-alpha-override", type=float, default=None)
+    parser.add_argument("--cr-alpha-frequency-transform", choices=["raw", "log"], default="raw")
     parser.add_argument("--cr-soft-top-m", type=int, default=4)
     parser.add_argument("--cr-soft-min-overlap-slots", type=int, default=2)
     parser.add_argument("--cr-soft-min-support", type=float, default=0.05)
@@ -649,6 +754,14 @@ def main() -> None:
     parser.add_argument("--cr-soft-hard-token-prior", type=float, default=1.0)
     parser.add_argument("--cr-soft-reliability-floor", type=float, default=0.10)
     parser.add_argument("--cr-soft-max-neighbors", type=int, default=50)
+    parser.add_argument("--cr-soft-lift-kappa", type=float, default=0.0)
+    parser.add_argument("--cr-soft-lift-clip", type=float, default=5.0)
+    parser.add_argument("--cr-soft-lift-eps", type=float, default=1e-6)
+    parser.add_argument("--cr-soft-decouple-reliability", action="store_true")
+    parser.add_argument("--cr-soft-behavior-weight", type=float, default=0.0)
+    parser.add_argument("--cr-soft-behavior-window", type=int, default=5)
+    parser.add_argument("--cr-soft-behavior-min-count", type=int, default=2)
+    parser.add_argument("--cr-soft-max-behavior-neighbors", type=int, default=50)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)
