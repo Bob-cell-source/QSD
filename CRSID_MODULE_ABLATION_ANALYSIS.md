@@ -327,3 +327,209 @@ dim = 128
 ```
 
 当前单 seed 结果趋势非常一致，可以作为方法选择依据；多 seed 主要用于增强论文可信度。
+
+## 8. Beauty LC-SoftSID 必要消融结果
+
+本节记录 Beauty 数据集上的 LC-SoftSID 必要消融结果，结果来自：
+
+```text
+runs/beauty/lc_soft_required_ablation/summary.csv
+```
+
+核心配置：
+
+```text
+dataset = Beauty
+dim = 128
+batch_size = 1024
+num_random_neg = 100
+num_hard_neg = 0
+max_len = 50
+lr = 0.001
+weight_decay = 0.0001
+seed = 2026
+metric = full-ranking NDCG@10 / HR@10 / NDCG@20
+```
+
+需要特别说明：这一组是“必要消融”结果，主要用于比较模块相对贡献。当前最好主方法结果中有部分实验跑了更长训练，例如 100 epoch，而本轮消融中的若干实验实际训练轮数较少或 early stopping 条件不同。因此本节结果不应直接用于和 100 epoch 最优主结果做最终性能比较，而应主要作为模块趋势分析。
+
+### 8.1 总体结果
+
+按测试集 NDCG@10 排序：
+
+| Rank | Experiment | NDCG@10 | HR@10 | NDCG@20 | HR@20 | Best Valid NDCG@10 |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `21_soft_no_local_pruning` | 0.051885 | 0.089881 | 0.061111 | 0.126593 | 0.062950 |
+| 2 | `20_lc_soft_full` | 0.051396 | 0.089478 | 0.060372 | 0.125117 | 0.063337 |
+| 3 | `10_hard_crsid` | 0.051285 | 0.090283 | 0.060418 | 0.126593 | 0.062951 |
+| 4 | `22_soft_eta1_no_sharpen` | 0.051223 | 0.088897 | 0.060351 | 0.125117 | 0.063117 |
+| 5 | `40_with_behavior_neighbors_w050` | 0.048582 | 0.086750 | 0.058052 | 0.124357 | 0.062953 |
+| 6 | `30_no_shared_residual` | 0.047690 | 0.084515 | 0.057436 | 0.123195 | 0.062024 |
+| 7 | `00_sasrec_id_only` | 0.044830 | 0.077047 | 0.052492 | 0.107454 | 0.058633 |
+| 8 | `31_no_private_residual` | 0.034128 | 0.065063 | 0.042563 | 0.098556 | 0.045334 |
+
+### 8.2 主要结论
+
+#### 8.2.1 CRSID / LC-SoftSID 表示整体有效
+
+Hard CRSID 相比纯 ID SASRec 有明显提升：
+
+```text
+Hard CRSID:     NDCG@10 = 0.051285
+SASRec ID-only: NDCG@10 = 0.044830
+Absolute gain:  +0.006455
+Relative gain:  +14.40%
+```
+
+这说明在 Beauty 上，Semantic ID 相关的 item representation 明显优于纯 ID 序列推荐。该结果支持本文的基本动机：Semantic ID 的共享结构可以为序列推荐提供额外泛化能力。
+
+#### 8.2.2 LC-SoftSID 相比 hard CRSID 有小幅正向提升
+
+```text
+LC-SoftSID full: NDCG@10 = 0.051396
+Hard CRSID:      NDCG@10 = 0.051285
+Absolute gain:   +0.000111
+Relative gain:   +0.22%
+```
+
+本轮必要消融中，soft SID 相比 hard SID 的提升幅度较小，但方向为正。结合之前 Beauty soft tuning 中更长训练和更充分调参的结果，soft SID 方向仍然是有效的。不过本轮消融不能单独作为最终主性能结论。
+
+#### 8.2.3 no local pruning 在本轮 Beauty 上最好
+
+```text
+No local pruning: NDCG@10 = 0.051885
+LC-SoftSID full:  NDCG@10 = 0.051396
+```
+
+这说明 Beauty 上 `cr_soft_min_support=0.05` 可能偏保守。Beauty 商品语义较细碎，很多有效候选 token 在局部邻域中的支持度可能不高，严格 local pruning 可能剪掉一部分有用共享。
+
+该结果不说明 local-consistent soft SID 的方向错误，而是说明 Beauty 上 soft candidate SID 的收益主要来自多候选表示和支持度加权；local pruning 阈值对数据集较敏感。论文表述应避免把 local pruning 说成在所有数据集上必然提升，而应写成：
+
+```text
+Local support is used to control candidate reliability. Its threshold can be tuned by validation, and overly strict pruning may remove useful fine-grained candidates on dense product domains.
+```
+
+中文可写为：
+
+```text
+局部支持度约束用于提高候选 SID 的可靠性，但其阈值需要结合数据集验证集选择。
+在 Beauty 这类细粒度商品域中，过强的剪枝可能损失一部分有效候选 token。
+```
+
+#### 8.2.4 support sharpening 有小幅作用
+
+对比：
+
+```text
+LC-SoftSID full eta=2: NDCG@10 = 0.051396
+eta=1 no sharpen:      NDCG@10 = 0.051223
+```
+
+`support_eta=2.0` 比 `eta=1.0` 略好，说明局部支持度更高的 token 应被更强强调。这支持 soft SID 权重设计：
+
+```text
+s_{i,l}(c) = cnt_{i,l}(c)^\eta
+```
+
+不过该提升幅度较小，不应被夸大为主要性能来源。
+
+#### 8.2.5 用户侧行为邻域当前不是正收益
+
+行为邻域版本：
+
+```text
+Behavior neighbor w=0.5: NDCG@10 = 0.048582
+LC-SoftSID full:         NDCG@10 = 0.051396
+```
+
+下降：
+
+```text
+-0.002814 NDCG@10
+```
+
+这说明当前基于训练序列窗口共现的 behavior neighbor 会给 Beauty 引入明显噪声。用户共现邻域可能把 item 拉向同一用户历史中的泛主题，而不一定是同系列或同语义功能 item，这与 semantic drift 的风险一致。
+
+因此，当前最终主方法不采用 behavior neighbor。论文中如果保留“用户侧信息补充”的叙述，需要非常谨慎：它可以作为探索性扩展或 future work，而不应作为已经稳定验证的核心贡献。更稳妥的写法是：
+
+```text
+We further examine a train-only behavior-neighbor augmentation, but observe that naive co-occurrence neighbors introduce noise on Beauty. Therefore, the final model adopts the semantic local-consistency version.
+```
+
+#### 8.2.6 shared residual 有明显作用
+
+去掉 shared semantic residual：
+
+```text
+LC-SoftSID full:       NDCG@10 = 0.051396
+No shared residual:    NDCG@10 = 0.047690
+Drop:                 -0.003706
+Relative drop:        -7.21%
+```
+
+这说明 Semantic ID token 共享残差确实提供了有用的跨 item 泛化能力，尤其对于低频 item 和共享语义结构中的 item 有意义。
+
+#### 8.2.7 private residual 是 Beauty 上最关键的模块
+
+去掉 private item residual 后性能大幅下降：
+
+```text
+LC-SoftSID full:       NDCG@10 = 0.051396
+No private residual:   NDCG@10 = 0.034128
+Drop:                 -0.017268
+Relative drop:        -33.60%
+```
+
+这是本轮 Beauty 消融中最强的模块证据。它说明不能只依赖 Semantic ID 共享。Beauty 中大量 item 具有细粒度差异，只用语义共享会严重损失 item-level 区分能力。private residual 对消除语义漂移和保留 item 个体差异非常关键。
+
+该结果可以直接支撑方法设计中的 shared/private residual 分解：
+
+```text
+Shared semantic residual provides transfer across related items,
+while private item residual preserves item-specific collaborative distinctions.
+Both are necessary, and the private residual is especially important in fine-grained product domains.
+```
+
+### 8.3 与 100 epoch 最优主结果的关系
+
+之前 Beauty soft tuning 中，当前较好的长训练配置为：
+
+```text
+27_crsid_soft_m4_s005_prior1_eta2_n50
+NDCG@10 = 0.052575
+HR@10   = 0.091177
+NDCG@20 = 0.061586
+```
+
+而本轮必要消融中的 `20_lc_soft_full` 为：
+
+```text
+NDCG@10 = 0.051396
+HR@10   = 0.089478
+NDCG@20 = 0.060372
+```
+
+二者并不完全可比，因为训练轮数、early stopping 状态和实验目录不同。因此本节的 `20_lc_soft_full` 不应替代之前的 Beauty 最优主结果。合理使用方式是：
+
+```text
+1. 主表报告统一训练设置下的最终主方法结果。
+2. 消融表报告同一组必要消融内部的相对趋势。
+3. 不用不同 epoch / 不同 early stopping 的结果混合计算最终提升幅度。
+```
+
+这也是为什么本节更强调模块趋势，而不是声称 `21_soft_no_local_pruning` 就是最终 Beauty 主方法。
+
+### 8.4 Beauty 消融小结
+
+Beauty 必要消融可以总结为：
+
+```text
+1. Hard CRSID 和 LC-SoftSID 均明显优于纯 ID SASRec，说明 Semantic ID item representation 有效。
+2. LC-SoftSID full 相比 hard CRSID 有小幅提升，但本轮消融不是最终主性能实验。
+3. support_eta=2.0 略优于 eta=1.0，支持局部支持度加权。
+4. local pruning 在 Beauty 上不是正收益，说明该阈值具有数据集敏感性。
+5. behavior neighbor 当前引入噪声，不进入最终主方法。
+6. shared residual 有明显贡献，private residual 是最关键模块。
+```
+
+论文写作中，建议将 Beauty 消融重点放在 residual 分解和 Semantic ID representation 的有效性上；对 local pruning 与 behavior neighbor 采用谨慎表述。

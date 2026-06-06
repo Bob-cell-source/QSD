@@ -105,6 +105,15 @@ run_dataset() {
     --dis-weight 0 \
     --div-weight 0
 
+  # 1b. Simple score-level semantic enhancement. This is the key baseline for
+  # showing that LC-SoftSID is not just adding a naive semantic branch.
+  run_exp "${dataset_dir}" "01_qsdrec_semantic_score" \
+    --model-variant qsdrec \
+    --num-interests 4 \
+    --sem-weight 0.10 \
+    --dis-weight 0 \
+    --div-weight 0
+
   # 2. Hard CRSID. Isolates the gain from soft SID over hard Semantic ID.
   run_exp "${dataset_dir}" "10_hard_crsid" \
     --model-variant crsid \
