@@ -9,7 +9,12 @@ DATASETS="${DATASETS:-runs/beauty runs/sports runs/toys_games}"
 DEVICE="${DEVICE:-cuda}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 EVAL_BATCH_EVAL_SIZE="${EVAL_BATCH_EVAL_SIZE:-256}"
-OUT_NAME="${OUT_NAME:-lcsoft_group_benchmark}"
+# Keep the stricter group definitions in a new directory so earlier grouped
+# results remain available for comparison.
+OUT_NAME="${OUT_NAME:-lcsoft_group_benchmark_v2}"
+POPULAR_TOKEN_QUANTILE="${POPULAR_TOKEN_QUANTILE:-0.90}"
+MISMATCH_TITLE_JACCARD="${MISMATCH_TITLE_JACCARD:-0.30}"
+MISMATCH_MIN_TITLE_OVERLAP="${MISMATCH_MIN_TITLE_OVERLAP:-2}"
 
 run_dataset() {
   local dataset_dir="$1"
@@ -69,6 +74,9 @@ run_dataset() {
     --device "${DEVICE}" \
     --batch-size "${BATCH_SIZE}" \
     --eval-batch-eval-size "${EVAL_BATCH_EVAL_SIZE}" \
+    --popular-token-quantile "${POPULAR_TOKEN_QUANTILE}" \
+    --mismatch-title-jaccard "${MISMATCH_TITLE_JACCARD}" \
+    --mismatch-min-title-overlap "${MISMATCH_MIN_TITLE_OVERLAP}" \
     "${checkpoints[@]}"
 }
 

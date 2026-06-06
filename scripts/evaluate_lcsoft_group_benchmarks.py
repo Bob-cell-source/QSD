@@ -29,6 +29,26 @@ from qsdrec.train import (
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
+TITLE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+    "new",
+    "pack",
+    "set",
+    "size",
+}
 
 
 def parse_checkpoint_specs(specs: Sequence[str]) -> Dict[str, Path]:
@@ -46,7 +66,11 @@ def parse_ks(value: str) -> Tuple[int, ...]:
 
 
 def tokenize(text: str) -> set[str]:
-    return set(TOKEN_RE.findall((text or "").lower()))
+    return {
+        token
+        for token in TOKEN_RE.findall((text or "").lower())
+        if token not in TITLE_STOPWORDS and len(token) > 1
+    }
 
 
 def title_jaccard(a: set[str], b: set[str]) -> float:
@@ -114,50 +138,66 @@ def build_popular_token_flags(
         for slot, code in enumerate(sid):
             slot_counts[slot][int(code)] += 1
 
-    thresholds = []
-    for counts in slot_counts:
-        values = sorted(counts.values())
-        if not values:
-            thresholds.append(0)
-            continue
-        idx = min(len(values) - 1, max(0, int(math.ceil(quantile * len(values))) - 1))
-        thresholds.append(values[idx])
-
-    flags = {}
+    # Aggregate normalized per-slot token frequencies into one item-level
+    # hubness score. Quantiling these item scores avoids the old "any popular
+    # token" rule, which marked almost every item when the SID has many slots.
+    slot_max_counts = [max(counts.values(), default=1) for counts in slot_counts]
+    item_scores = {}
     for item, sid in item_semantic_ids.items():
-        flags[item] = any(slot_counts[slot][int(code)] >= thresholds[slot] for slot, code in enumerate(sid))
-    return flags, {"quantile": quantile, "slot_thresholds": thresholds}
+        normalized = [
+            math.log1p(slot_counts[slot][int(code)]) / math.log1p(slot_max_counts[slot])
+            for slot, code in enumerate(sid)
+        ]
+        item_scores[item] = sum(normalized) / max(len(normalized), 1)
+
+    values = sorted(item_scores.values())
+    if values:
+        idx = min(len(values) - 1, max(0, int(math.ceil(quantile * len(values))) - 1))
+        threshold = values[idx]
+    else:
+        threshold = float("inf")
+    flags = {item: score >= threshold for item, score in item_scores.items()}
+    return flags, {
+        "quantile": quantile,
+        "item_hubness_threshold": threshold,
+        "num_flagged_items": sum(flags.values()),
+        "num_items": len(flags),
+        "score_definition": "mean slot-wise log-normalized SID token frequency",
+    }
 
 
-def has_shared_prefix(history: Sequence[int], target: int, item_semantic_ids: Dict[int, List[int]], prefix_level: int) -> bool:
-    target_sid = item_semantic_ids.get(target)
-    if target_sid is None:
-        return False
-    target_prefix = tuple(target_sid[:prefix_level])
-    for item in history:
-        sid = item_semantic_ids.get(int(item))
-        if sid is not None and tuple(sid[:prefix_level]) == target_prefix:
-            return True
-    return False
+def sid_overlap(a: Sequence[int], b: Sequence[int]) -> int:
+    return sum(int(x) == int(y) for x, y in zip(a, b))
 
 
-def has_item_side_match(
+def has_hard_sid_mismatch(
     history: Sequence[int],
     target: int,
     features: Dict[int, Dict[str, Any]],
+    item_semantic_ids: Dict[int, List[int]],
     title_threshold: float,
+    min_title_overlap: int,
+    min_sid_overlap: int,
 ) -> bool:
     target_feat = features.get(target, {})
     target_brand = target_feat.get("brand", "")
-    target_categories = target_feat.get("categories", set())
     target_title = target_feat.get("title_tokens", set())
+    target_sid = item_semantic_ids.get(target)
+    if target_sid is None or not target_title:
+        return False
+
     for item in history:
         feat = features.get(int(item), {})
-        if target_brand and target_brand == feat.get("brand", ""):
-            return True
-        if target_categories and target_categories.intersection(feat.get("categories", set())):
-            return True
-        if title_jaccard(target_title, feat.get("title_tokens", set())) >= title_threshold:
+        history_title = feat.get("title_tokens", set())
+        overlap = len(target_title.intersection(history_title))
+        same_brand = bool(target_brand and target_brand == feat.get("brand", ""))
+        strong_title_match = overlap >= min_title_overlap and title_jaccard(target_title, history_title) >= title_threshold
+        brand_supported_match = same_brand and overlap >= 1
+        if not (strong_title_match or brand_supported_match):
+            continue
+
+        history_sid = item_semantic_ids.get(int(item))
+        if history_sid is not None and sid_overlap(target_sid, history_sid) < min_sid_overlap:
             return True
     return False
 
@@ -186,11 +226,14 @@ def sample_groups(
         groups.append("isolated_sid")
     if popular_token_flags.get(target, False):
         groups.append("popular_token")
-    if has_item_side_match(history, target, features, args.mismatch_title_jaccard) and not has_shared_prefix(
+    if has_hard_sid_mismatch(
         history,
         target,
+        features,
         item_semantic_ids,
-        args.prefix_level,
+        args.mismatch_title_jaccard,
+        args.mismatch_min_title_overlap,
+        args.min_overlap_slots,
     ):
         groups.append("mismatch")
     return groups
@@ -430,7 +473,8 @@ def main() -> None:
     parser.add_argument("--isolated-prefix-threshold", type=int, default=1)
     parser.add_argument("--isolated-overlap-threshold", type=int, default=1)
     parser.add_argument("--popular-token-quantile", type=float, default=0.90)
-    parser.add_argument("--mismatch-title-jaccard", type=float, default=0.20)
+    parser.add_argument("--mismatch-title-jaccard", type=float, default=0.30)
+    parser.add_argument("--mismatch-min-title-overlap", type=int, default=2)
     args = parser.parse_args()
 
     checkpoints = parse_checkpoint_specs(args.checkpoint)
@@ -462,6 +506,8 @@ def main() -> None:
         for seq, target in test_data
     ]
     group_counts = Counter(group for groups in sample_group_lists for group in groups)
+    num_test_samples = len(test_data)
+    group_rates = {group: count / max(num_test_samples, 1) for group, count in group_counts.items()}
 
     loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_full_eval)
     model_results = {}
@@ -513,6 +559,7 @@ def main() -> None:
             rows.append(row)
 
     output = {
+        "group_definition_version": "v2_strict_item_hubness_and_sid_mismatch",
         "dataset_dir": str(dataset_dir),
         "semantic_ids": str(semantic_path),
         "checkpoints": {label: str(path) for label, path in checkpoints.items()},
@@ -524,21 +571,38 @@ def main() -> None:
                 f"prefix group size <= {args.isolated_prefix_threshold} or "
                 f"overlap group size <= {args.isolated_overlap_threshold}"
             ),
-            "popular_token": f"target SID contains slot token above quantile {args.popular_token_quantile}",
+            "popular_token": (
+                "target item-level SID hubness is at or above quantile "
+                f"{args.popular_token_quantile}; hubness averages slot-wise log-normalized token frequencies"
+            ),
             "mismatch": (
-                "history has brand/category/title-similar item but no shared target prefix; "
-                f"title_jaccard >= {args.mismatch_title_jaccard}"
+                "history contains an item-side match (same brand with >=1 informative shared title token, or "
+                f">={args.mismatch_min_title_overlap} shared title tokens with title_jaccard >= "
+                f"{args.mismatch_title_jaccard}) whose hard SID shares fewer than "
+                f"{args.min_overlap_slots} aligned slots with the target"
             ),
         },
         "popular_token_meta": popular_meta,
         "group_counts": dict(group_counts),
+        "group_rates": group_rates,
         "model_args": model_args,
         "model_results": model_results,
         "rows": rows,
     }
     write_json(output_path, output)
     write_csv_rows(rows, csv_path)
-    print(json.dumps({"group_counts": dict(group_counts), "csv": str(csv_path)}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "group_definition_version": output["group_definition_version"],
+                "group_counts": dict(group_counts),
+                "group_rates": group_rates,
+                "csv": str(csv_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
