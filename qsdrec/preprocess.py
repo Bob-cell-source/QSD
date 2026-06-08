@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Tuple
 
 from .io_utils import iter_json_records, write_json
 
-
+# 清洗并统一文本字段格式
 def _clean_text(value: Any) -> str:
     if value is None:
         return ""
@@ -53,7 +53,7 @@ def detect_meta_item_key(meta_path: str | Path) -> str:
         return "parent_asin"
     return "auto"
 
-
+# 加载并规范化商品文本及类别元数据
 def load_meta(meta_path: str | Path, item_key: str = "auto") -> Dict[str, Dict[str, Any]]:
     items: Dict[str, Dict[str, Any]] = {}
     for row in iter_json_records(meta_path):
@@ -89,7 +89,7 @@ def _review_text(row: Dict[str, Any], max_chars: int = 1200) -> str:
     text = _clean_text([row.get("title"), row.get("text")])
     return text[:max_chars]
 
-
+# 加载用户交互序列，按需从评论中构建商品备用元数据
 def load_interactions_with_review_meta(
     reviews_path: str | Path,
     min_rating: float,
@@ -148,7 +148,7 @@ def load_interactions(
     )
     return by_user
 
-
+# 迭代执行用户-物品 k-core 过滤
 def filter_k_core(
     by_user: Dict[str, List[Tuple[int, str, float]]],
     meta: Dict[str, Dict[str, Any]],

@@ -531,3 +531,95 @@ soft 版本在 Beauty 上取得了小幅但稳定的提升，说明 local-consis
 对应的方法摘要可以写为：
 
 > We propose LC-Soft CRSID, a local-consistent soft Semantic ID representation learning framework for sequential recommendation. Instead of treating each item as a single hard Semantic ID path, LC-Soft CRSID constructs a locally supported candidate token distribution for each Semantic ID slot, which mitigates both under-sharing caused by Semantic ID mismatch and over-sharing caused by popular semantic tokens. Based on the soft Semantic ID, each item is represented by a semantic basis, a shared semantic residual, and a private ID residual. A reliability-aware residual allocation mechanism adaptively balances semantic generalization and item-level memorization. The resulting item representation is directly used by the sequence encoder and optimized with the standard next-item recommendation objective.
+
+## 10. 主实验结果表
+
+### 10.1 表格设计依据
+
+主结果表综合参考序列推荐与 Semantic ID 推荐论文的实验呈现方式：SASRec 在多个数据集上同时报告 Hit Rate 和 NDCG；TIGER 在 Amazon 推荐数据集上报告多个截断位置的 NDCG 与 Recall；近期 AAAI 序列推荐论文通常采用“数据集分块、方法为行、多个 Top-\(K\) 指标为列”的结构，并用粗体和下划线分别标记最佳与次优结果。
+
+参考论文如下：
+
+1. [Self-Attentive Sequential Recommendation, ICDM 2018](https://cseweb.ucsd.edu/~jmcauley/pdfs/icdm18.pdf)。
+2. [Recommender Systems with Generative Retrieval, NeurIPS 2023](https://openreview.net/pdf?id=BJ0fQUU32w)。
+3. [An Attentive Inductive Bias for Sequential Recommendation beyond the Self-Attention, AAAI 2024](https://ojs.aaai.org/index.php/AAAI/article/download/28747/29438)。
+
+基于当前评测协议，表中统一报告 \(\mathrm{NDCG}@K\) 和 \(\mathrm{HR}@K\)，其中 \(K\in\{5,10,20\}\)。粗体表示当前四种对比方法中的最优结果，下划线表示次优结果。所有指标均来自全物品排序评测，并在排序前屏蔽用户已经交互过的历史物品。
+
+### 10.2 当前主结果
+
+| Dataset | Method | NDCG@5 | HR@5 | NDCG@10 | HR@10 | NDCG@20 | HR@20 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Office\(^\dagger\) | SASRec | 0.05066 | 0.07278 | 0.06124 | 0.10601 | 0.07521 | 0.16208 |
+|  | QSDRec | 0.04824 | 0.07074 | 0.05976 | 0.10663 | 0.07386 | 0.16249 |
+|  | Hard CRSID | <u>0.05523</u> | <u>0.08175</u> | <u>0.06601</u> | <u>0.11519</u> | <u>0.07943</u> | <u>0.16881</u> |
+|  | **LC-SoftSID** | **0.05568** | **0.08196** | **0.06743** | **0.11865** | **0.08091** | **0.17207** |
+| Beauty | SASRec | 0.03743 | 0.05393 | 0.04483 | 0.07705 | 0.05249 | 0.10745 |
+|  | QSDRec | 0.03409 | 0.04968 | 0.04153 | 0.07271 | 0.05003 | 0.10656 |
+|  | Hard CRSID | <u>0.04215</u> | **0.06171** | <u>0.05128</u> | **0.09028** | **0.06042** | **0.12659** |
+|  | **LC-SoftSID** | **0.04231** | <u>0.06131</u> | **0.05140** | <u>0.08948</u> | <u>0.06037</u> | <u>0.12512</u> |
+| Sports | SASRec | 0.01935 | 0.02826 | 0.02396 | 0.04259 | 0.02904 | 0.06281 |
+|  | QSDRec | 0.01899 | 0.02804 | 0.02351 | 0.04217 | 0.02884 | 0.06337 |
+|  | Hard CRSID | <u>0.02277</u> | <u>0.03357</u> | <u>0.02849</u> | <u>0.05130</u> | <u>0.03435</u> | <u>0.07458</u> |
+|  | **LC-SoftSID** | **0.02294** | **0.03410** | **0.02892** | **0.05278** | **0.03449** | **0.07506** |
+| Toys and Games | SASRec | 0.05401 | 0.07242 | 0.06277 | 0.09949 | 0.07055 | 0.13046 |
+|  | QSDRec | 0.05292 | 0.07073 | 0.06039 | 0.09389 | 0.06826 | 0.12513 |
+|  | Hard CRSID | **0.05939** | **0.08644** | <u>0.06945</u> | <u>0.11750</u> | <u>0.07905</u> | <u>0.15548</u> |
+|  | **LC-SoftSID** | <u>0.05907</u> | <u>0.08546</u> | **0.06982** | **0.11892** | **0.07933** | **0.15673** |
+
+对应的 LaTeX 三线表如下，可直接放入论文并引入 `booktabs` 与 `multirow` 宏包：
+
+```latex
+\begin{table*}[t]
+\centering
+\caption{Overall performance comparison on four Amazon datasets. The best and second-best results are marked in bold and underlined, respectively.}
+\label{tab:overall_performance}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccccc}
+\toprule
+Dataset & Method & NDCG@5 & HR@5 & NDCG@10 & HR@10 & NDCG@20 & HR@20 \\
+\midrule
+\multirow{4}{*}{Office$^\dagger$}
+& SASRec & 0.05066 & 0.07278 & 0.06124 & 0.10601 & 0.07521 & 0.16208 \\
+& QSDRec & 0.04824 & 0.07074 & 0.05976 & 0.10663 & 0.07386 & 0.16249 \\
+& Hard CRSID & \underline{0.05523} & \underline{0.08175} & \underline{0.06601} & \underline{0.11519} & \underline{0.07943} & \underline{0.16881} \\
+& \textbf{LC-SoftSID} & \textbf{0.05568} & \textbf{0.08196} & \textbf{0.06743} & \textbf{0.11865} & \textbf{0.08091} & \textbf{0.17207} \\
+\midrule
+\multirow{4}{*}{Beauty}
+& SASRec & 0.03743 & 0.05393 & 0.04483 & 0.07705 & 0.05249 & 0.10745 \\
+& QSDRec & 0.03409 & 0.04968 & 0.04153 & 0.07271 & 0.05003 & 0.10656 \\
+& Hard CRSID & \underline{0.04215} & \textbf{0.06171} & \underline{0.05128} & \textbf{0.09028} & \textbf{0.06042} & \textbf{0.12659} \\
+& \textbf{LC-SoftSID} & \textbf{0.04231} & \underline{0.06131} & \textbf{0.05140} & \underline{0.08948} & \underline{0.06037} & \underline{0.12512} \\
+\midrule
+\multirow{4}{*}{Sports}
+& SASRec & 0.01935 & 0.02826 & 0.02396 & 0.04259 & 0.02904 & 0.06281 \\
+& QSDRec & 0.01899 & 0.02804 & 0.02351 & 0.04217 & 0.02884 & 0.06337 \\
+& Hard CRSID & \underline{0.02277} & \underline{0.03357} & \underline{0.02849} & \underline{0.05130} & \underline{0.03435} & \underline{0.07458} \\
+& \textbf{LC-SoftSID} & \textbf{0.02294} & \textbf{0.03410} & \textbf{0.02892} & \textbf{0.05278} & \textbf{0.03449} & \textbf{0.07506} \\
+\midrule
+\multirow{4}{*}{Toys and Games}
+& SASRec & 0.05401 & 0.07242 & 0.06277 & 0.09949 & 0.07055 & 0.13046 \\
+& QSDRec & 0.05292 & 0.07073 & 0.06039 & 0.09389 & 0.06826 & 0.12513 \\
+& Hard CRSID & \textbf{0.05939} & \textbf{0.08644} & \underline{0.06945} & \underline{0.11750} & \underline{0.07905} & \underline{0.15548} \\
+& \textbf{LC-SoftSID} & \underline{0.05907} & \underline{0.08546} & \textbf{0.06982} & \textbf{0.11892} & \textbf{0.07933} & \textbf{0.15673} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+```
+
+其中，\(^\dagger\) 表示 Office 来自较早但完整的对照实验批次，具体配置差异见第 10.4 节。
+
+### 10.3 结果分析
+
+与纯 ID 的 SASRec 相比，LC-SoftSID 在四个数据集上的 NDCG@10 相对提升分别为 10.10%、14.65%、20.71% 和 11.24%，说明将 Semantic ID 共享信息引入统一物品表示后，模型在不同稀疏度的数据集上均获得了稳定收益。相比简单分数级语义增强 QSDRec，LC-SoftSID 在所有数据集和主要指标上均表现更好，说明直接叠加语义匹配分数不足以处理语义共享中的噪声和漂移。
+
+与采用单一路径 Hard SID 的 CRSID 相比，LC-SoftSID 在 Office、Beauty、Sports 和 Toys and Games 上的 NDCG@10 分别提升 2.15%、0.22%、1.50% 和 0.54%。这说明局部一致的候选 SID 在整体排序指标上提供了额外收益，但增益幅度明显小于完整语义残差框架相对 SASRec 的提升。因此，当前结果更适合支持两个层次的结论：第一，语义基底与共享/私有残差构成的统一表示是整体性能提升的主要来源；第二，Local-Consistent Soft SID 在 Hard CRSID 之上进一步改善了 Top-10 排序，并且其作用应结合低频、孤立 SID 和热门 token 分组实验进行验证。
+
+Beauty 上 LC-SoftSID 的 NDCG@5 和 NDCG@10 略高于 Hard CRSID，但 HR 指标略低；Toys and Games 上 Hard CRSID 在 Top-5 更优，而 LC-SoftSID 在 Top-10 和 Top-20 更优。因此不能声称 LC-SoftSID 在所有指标上全面超过 Hard CRSID，更准确的结论是：Soft SID 对中等和较深截断位置的整体排序更有帮助，但不同数据集的前排精确排序仍存在波动。
+
+### 10.4 可复现性说明
+
+Beauty、Sports 和 Toys and Games 的结果来自同一正式实验脚本，统一使用 128 维表示、100 个随机负样本、batch size 1024 和随机种子 2026。Office 结果来自较早的 `crsid_soft_probe` 批次，使用 batch size 512；其 LC-SoftSID 使用 \(\eta=1\)，其余三个数据集使用 \(\eta=2\)。batch size 主要影响训练吞吐，但 Soft SID 权重指数的差异应在最终投稿前通过统一配置或明确的验证集超参数选择协议处理。
+
+当前表格为单随机种子结果，尚不能报告均值、标准差或统计显著性。正式论文若强调 LC-SoftSID 相比 Hard CRSID 的小幅整体增益，应至少对 SASRec、Hard CRSID 和 LC-SoftSID 补充三个随机种子，并报告均值与标准差；否则应将主要证据放在跨数据集一致趋势、模块消融及困难样本分组提升上。

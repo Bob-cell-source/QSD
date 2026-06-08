@@ -3,6 +3,7 @@ from typing import Dict, Literal, Tuple
 
 import torch
 from torch import nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class PointWiseFeedForward(nn.Module):
@@ -156,6 +157,110 @@ class SASRecDynamicEncoder(nn.Module):
         return h[:, -1], h
 
 
+class GRU4RecDynamicEncoder(nn.Module):
+    """GRU4Rec encoder that consumes externally constructed item representations."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.input_dropout = nn.Dropout(dropout)
+        self.gru = nn.GRU(
+            input_size=dim,
+            hidden_size=dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.norm = nn.LayerNorm(dim, eps=1e-8)
+        self.dim = dim
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for name, param in self.gru.named_parameters():
+            if "weight" in name:
+                nn.init.xavier_normal_(param)
+            else:
+                nn.init.zeros_(param)
+
+    def forward(self, seq: torch.Tensor, item_repr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch, length = seq.shape
+        lengths = seq.ne(0).sum(dim=1).clamp_min(1)
+
+        # Dataset sequences are left padded. GRU packing expects valid tokens
+        # first, so move each non-padding suffix to the beginning.
+        positions = torch.arange(length, device=seq.device).unsqueeze(0).expand(batch, -1)
+        source = length - lengths.unsqueeze(1) + positions
+        valid = positions < lengths.unsqueeze(1)
+        source = source.clamp(max=length - 1)
+        gather_index = source.unsqueeze(-1).expand(-1, -1, self.dim)
+        right_padded = item_repr.gather(1, gather_index)
+        right_padded = self.input_dropout(right_padded) * valid.unsqueeze(-1)
+
+        packed = pack_padded_sequence(
+            right_padded,
+            lengths.cpu(),
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        packed_output, hidden = self.gru(packed)
+        output, _ = pad_packed_sequence(
+            packed_output,
+            batch_first=True,
+            total_length=length,
+        )
+        output = self.norm(output) * valid.unsqueeze(-1)
+        last = self.norm(hidden[-1])
+        return last, output
+
+
+class GRU4Rec(nn.Module):
+    """ID-only GRU4Rec baseline with tied input and candidate embeddings."""
+
+    def __init__(
+        self,
+        num_items: int,
+        dim: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.item_emb = nn.Embedding(num_items + 1, dim, padding_idx=0)
+        self.encoder = GRU4RecDynamicEncoder(dim, num_layers, dropout)
+        self.dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_normal_(self.item_emb.weight)
+        with torch.no_grad():
+            self.item_emb.weight[0].fill_(0)
+
+    def item_representation(self, items: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.item_emb(items)) * items.ne(0).unsqueeze(-1)
+
+    def forward(self, seq: torch.Tensor, candidates: torch.Tensor, sem_weight: float = 1.0) -> Dict[str, torch.Tensor]:
+        del sem_weight
+        seq_repr = self.item_representation(seq)
+        user_repr, _ = self.encoder(seq, seq_repr)
+        cand_repr = self.item_representation(candidates)
+        score = torch.einsum("bd,bcd->bc", user_repr, cand_repr)
+        return {
+            "score": score,
+            "id_score": score,
+            "sem_score": torch.zeros_like(score),
+            "amateur_sem_score": torch.zeros_like(score),
+            "hub_loss": score.new_tensor(0.0),
+            "residual_l2": score.new_tensor(0.0),
+        }
+
+    @staticmethod
+    def diversity_loss(queries: torch.Tensor) -> torch.Tensor:
+        return queries.new_tensor(0.0)
+
+
 class CRSIDRec(nn.Module):
     def __init__(
         self,
@@ -182,13 +287,19 @@ class CRSIDRec(nn.Module):
         disable_private_residual: bool = False,
         alpha_override: float | None = None,
         alpha_frequency_transform: Literal["raw", "log"] = "raw",
+        encoder_type: Literal["sasrec", "gru4rec"] = "sasrec",
     ) -> None:
         super().__init__()
         if alpha_mode not in {"item_frequency", "semantic_hubness"}:
             raise ValueError(f"Unsupported alpha_mode: {alpha_mode}")
         if alpha_frequency_transform not in {"raw", "log"}:
             raise ValueError(f"Unsupported alpha_frequency_transform: {alpha_frequency_transform}")
-        self.encoder = SASRecDynamicEncoder(dim, max_len, num_heads, num_layers, dropout)
+        if encoder_type == "sasrec":
+            self.encoder = SASRecDynamicEncoder(dim, max_len, num_heads, num_layers, dropout)
+        elif encoder_type == "gru4rec":
+            self.encoder = GRU4RecDynamicEncoder(dim, num_layers, dropout)
+        else:
+            raise ValueError(f"Unsupported encoder_type: {encoder_type}")
         self.register_buffer("semantic_id_table", semantic_id_table.long())
         if soft_semantic_id_table is not None and soft_semantic_id_weight is not None:
             if soft_semantic_id_table.shape != soft_semantic_id_weight.shape:
@@ -229,6 +340,7 @@ class CRSIDRec(nn.Module):
         self.disable_private_residual = disable_private_residual
         self.alpha_override = alpha_override
         self.alpha_frequency_transform = alpha_frequency_transform
+        self.encoder_type = encoder_type
         self.dim = dim
         self._init_weights()
 

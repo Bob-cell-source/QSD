@@ -1,6 +1,7 @@
 import argparse
 import math
 import re
+import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean
@@ -11,11 +12,11 @@ from .io_utils import read_json, write_json
 
 SPACE_RE = re.compile(r"\s+")
 
-
+# 合并连续空白符并去除首尾空白
 def normalize_text(text: str) -> str:
     return SPACE_RE.sub(" ", text or "").strip()
 
-
+# 根据特定标记截断描述，并限制最大词数
 def trim_description(text: str, max_words: int = 160) -> str:
     text = normalize_text(text)
     if not text:
@@ -34,7 +35,7 @@ def trim_description(text: str, max_words: int = 160) -> str:
     words = text.split()
     return " ".join(words[:max_words])
 
-
+# 拼接商品标题、品牌、类别和描述，构造编码器输入文本
 def build_item_text(meta: Dict, max_desc_words: int = 160) -> str:
     title = normalize_text(meta.get("title", ""))
     brand = normalize_text(meta.get("brand", ""))
@@ -52,14 +53,14 @@ def build_item_text(meta: Dict, max_desc_words: int = 160) -> str:
         parts.append(f"Description: {desc}")
     return " ".join(parts)
 
-
+# 加载物品文本和对应id
 def load_item_texts(item_meta_path: str | Path, max_desc_words: int = 160) -> Tuple[List[str], List[str]]:
     item_meta = read_json(item_meta_path)
     item_ids = sorted(item_meta.keys(), key=lambda x: int(x))
     texts = [build_item_text(item_meta[item_id], max_desc_words=max_desc_words) for item_id in item_ids]
     return item_ids, texts
 
-
+# 使用文本嵌入模型对物品文本进行编码
 def encode_texts(
     texts: Sequence[str],
     encoder_model: str,
@@ -89,7 +90,13 @@ def encode_texts(
             normalize_embeddings=True,
         )
         return embeddings.astype("float32")
-    except Exception:
+    except (ImportError, OSError, ValueError) as exc:
+        warnings.warn(
+            "SentenceTransformer encoding is unavailable or incompatible; "
+            f"falling back to transformers mean pooling. Original error: {exc!r}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         from transformers import AutoModel, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(encoder_model)
@@ -115,7 +122,7 @@ def encode_texts(
                 pooled = torch.nn.functional.normalize(pooled, dim=-1)
                 outputs.append(pooled.cpu())
         return torch.cat(outputs, dim=0).numpy().astype("float32")
-
+# 统计文本 token 长度及超过编码长度限制的比例
 def inspect_text_lengths(
     texts: Sequence[str],
     encoder_model: str,
@@ -173,7 +180,7 @@ def inspect_text_lengths(
                 if shown >= 5:
                     break
 
-
+# 汇总语义 ID 前缀分组规模及重复编码物品比例
 def summarize_sizes(sizes: List[int]) -> Dict[str, float | int]:
     if not sizes:
         return {
@@ -197,7 +204,7 @@ def summarize_sizes(sizes: List[int]) -> Dict[str, float | int]:
         "collision_item_rate": round((n_items - unique) / max(n_items, 1), 6),
     }
 
-
+# 分析各层语义 ID 前缀的分组规模和冲突情况
 def analyze_semantic_ids(
     semantic_id_path: str | Path,
     output_path: str | Path,
@@ -236,7 +243,7 @@ def analyze_semantic_ids(
             f"{row['max_size']}\t{row['groups_gt_1']}\t{row['collision_item_rate']}"
         )
 
-
+# 逐层训练残差 K-Means 码本，并将各层聚类编号组成语义 ID
 def build_rq_kmeans_from_embeddings(
     embeddings,
     item_ids: Sequence[str],
@@ -273,7 +280,7 @@ def build_rq_kmeans_from_embeddings(
     }
     return semantic_ids
 
-
+# 编排文本构造、向量编码和 RQ-KMeans，为每个商品生成语义 ID
 def build_semantic_ids_with_encoder(
     item_meta_path: str | Path,
     output_path: str | Path,

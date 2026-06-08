@@ -39,11 +39,15 @@ DEFAULT_FIELDS = [
     "num_hard_neg",
     "prefix_level",
     "dim",
+    "num_layers",
+    "dropout",
     "batch_size",
     "num_random_neg",
     "max_len",
     "lr",
     "weight_decay",
+    "train_objective",
+    "grad_clip",
     "seed",
 ]
 

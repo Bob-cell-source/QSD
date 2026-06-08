@@ -74,7 +74,12 @@ run_exp() {
   echo "Elapsed:  $(format_seconds "${elapsed}")"
   echo
 }
-
+python scripts/preprocess_amazon.py \
+    --reviews data/reviews_Toys_and_Games_5.json.gz \
+    --meta data/meta_Toys_and_Games.jsonl.gz \
+    --output-dir runs/toys_games \
+    --min-user-inter 5 \
+    --min-item-inter 5
 # Baselines kept in the same output root for a direct summary table.
 run_exp "00_sasrec_id_only" \
   --model-variant qsdrec \

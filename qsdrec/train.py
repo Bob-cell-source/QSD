@@ -9,7 +9,11 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .io_utils import read_json, write_json
-from .model import CRSIDRec, QSDRec
+from .model import CRSIDRec, GRU4Rec, QSDRec
+
+
+CRSID_VARIANTS = {"crsid", "crsid_semhub", "crsid_soft", "gru4rec_lcsoft"}
+SOFT_SID_VARIANTS = {"crsid_soft", "gru4rec_lcsoft"}
 
 
 class NextItemDataset(Dataset):
@@ -466,7 +470,7 @@ def train(args) -> None:
     soft_semantic_weight = None
     semantic_reliability = None
     behavior_neighbors = None
-    if args.model_variant == "crsid_soft":
+    if args.model_variant in SOFT_SID_VARIANTS:
         if args.cr_soft_behavior_weight > 0.0:
             behavior_neighbors = build_behavior_neighbors(
                 sequences=sequences,
@@ -535,7 +539,7 @@ def train(args) -> None:
     )
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    if args.model_variant in {"crsid", "crsid_semhub", "crsid_soft"}:
+    if args.model_variant in CRSID_VARIANTS:
         model = CRSIDRec(
             num_items=num_items,
             num_semantic_tokens=num_semantic_tokens,
@@ -560,6 +564,14 @@ def train(args) -> None:
             disable_private_residual=args.cr_disable_private_residual,
             alpha_override=args.cr_alpha_override,
             alpha_frequency_transform=args.cr_alpha_frequency_transform,
+            encoder_type="gru4rec" if args.model_variant == "gru4rec_lcsoft" else "sasrec",
+        ).to(device)
+    elif args.model_variant == "gru4rec":
+        model = GRU4Rec(
+            num_items=num_items,
+            dim=args.dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
         ).to(device)
     else:
         model = QSDRec(
@@ -624,8 +636,10 @@ def train(args) -> None:
                 candidates = candidates.to(device)
                 out = model(seq, candidates, sem_weight=args.sem_weight)
                 rec_loss = cross_entropy_first_positive(out["score"])
-                if args.model_variant in {"crsid", "crsid_semhub", "crsid_soft"}:
+                if args.model_variant in CRSID_VARIANTS:
                     loss = rec_loss + args.cr_residual_reg * out["residual_l2"]
+                elif args.model_variant == "gru4rec":
+                    loss = rec_loss
                 else:
                     dis_loss = cross_entropy_first_positive(out["sem_score"])
                     div_loss = model.diversity_loss(out["queries"])
@@ -674,18 +688,22 @@ def train(args) -> None:
     if best_path.exists():
         state = torch.load(best_path, map_location=device)
         model.load_state_dict(state["model"])
-    test = evaluate_full_ranking(
-        model=model,
-        loader=test_loader,
-        device=device,
-        num_items=num_items,
-        sem_weight=args.sem_weight,
-        ks=(5, 10, 20),
-        batch_eval_size=args.eval_batch_eval_size,
-    )
+    if args.skip_test_evaluation:
+        test = {}
+    else:
+        test = evaluate_full_ranking(
+            model=model,
+            loader=test_loader,
+            device=device,
+            num_items=num_items,
+            sem_weight=args.sem_weight,
+            ks=(5, 10, 20),
+            batch_eval_size=args.eval_batch_eval_size,
+        )
     result = {
         "test": test,
         "best_valid_NDCG@10": best_metric,
+        "test_evaluated": not args.skip_test_evaluation,
         "args": vars(args),
     }
     write_json(output_dir / "history.json", history)
@@ -695,7 +713,11 @@ def train(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-variant", choices=["qsdrec", "crsid", "crsid_semhub", "crsid_soft"], default="qsdrec")
+    parser.add_argument(
+        "--model-variant",
+        choices=["qsdrec", "crsid", "crsid_semhub", "crsid_soft", "gru4rec", "gru4rec_lcsoft"],
+        default="qsdrec",
+    )
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--semantic-ids", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -775,6 +797,11 @@ def main() -> None:
     parser.add_argument("--train-candidate-chunk-size", type=int, default=4096)
     parser.add_argument("--eval-batch-eval-size", type=int, default=1024)
     parser.add_argument("--early-stop-patience", type=int, default=10)
+    parser.add_argument(
+        "--skip-test-evaluation",
+        action="store_true",
+        help="Tune on validation only; leave test metrics empty until the final selected configuration.",
+    )
     parser.add_argument("--prefix-level", type=int, default=2)
     parser.add_argument("--sem-weight", type=float, default=1.0)
     parser.add_argument("--dis-weight", type=float, default=0.2)
