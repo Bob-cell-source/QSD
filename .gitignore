@@ -8,7 +8,15 @@ desktop.ini
 .vscode/
 .idea/
 CCFA-Skills
-WISE论文
+
+# =========================
+# Private paper / thesis manuscripts
+# =========================
+/WISE论文/
+/PAPER_DRAFT_*.md
+/METHOD_LC_SOFT_CRSID_PAPER_*.md
+/LCSoftCRSID/METHOD_DRAFT.md
+
 # =========================
 # Python
 # =========================

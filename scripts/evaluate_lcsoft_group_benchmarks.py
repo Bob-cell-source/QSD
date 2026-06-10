@@ -22,6 +22,7 @@ from qsdrec.train import (
     build_semantic_hubness,
     build_semantic_table,
     build_soft_semantic_table,
+    build_text_knn_neighbors,
     build_train_item_frequency,
     collate_full_eval,
     load_mini_cluster_table,
@@ -294,6 +295,15 @@ def instantiate_model(
         soft_weight = None
         reliability = None
         if variant == "crsid_soft":
+            base_neighbors = None
+            if str(cfg.get("cr_soft_neighbor_source", "sid_overlap")) == "text_knn":
+                base_neighbors, _ = build_text_knn_neighbors(
+                    embeddings_path=cfg["cr_soft_text_embeddings"],
+                    item_ids_path=cfg["cr_soft_text_item_ids"],
+                    num_items=num_items,
+                    max_neighbors=int(cfg.get("cr_soft_max_neighbors", 50)),
+                    chunk_size=int(cfg.get("cr_soft_text_knn_chunk_size", 256)),
+                )
             behavior_neighbors = None
             if float(cfg.get("cr_soft_behavior_weight", 0.0)) > 0.0:
                 behavior_neighbors = build_behavior_neighbors(
@@ -320,6 +330,7 @@ def instantiate_model(
                 decouple_reliability=bool(cfg.get("cr_soft_decouple_reliability", False)),
                 behavior_neighbors=behavior_neighbors,
                 behavior_neighbor_weight=float(cfg.get("cr_soft_behavior_weight", 0.0)),
+                base_neighbors=base_neighbors,
             )
         model = CRSIDRec(
             num_items=num_items,

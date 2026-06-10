@@ -85,3 +85,28 @@ max_neighbors=50, random_negatives=100
 The clean implementation intentionally excludes QSDRec, GRU transfer probes,
 behavior-neighbor experiments, local-lift experiments, and unused score-level
 semantic branches.
+
+## Learnable candidate-weight probe
+
+The optional candidate selector keeps the local Top-M candidate set fixed and
+learns only how to weight candidates for the recommendation objective:
+
+```bash
+bash LCSoftCRSID/scripts/run_office_attention_probe.sh
+```
+
+This compares fixed local weights, attention without a local prior,
+prior-guided attention, and prior-guided attention with weak KL regularization.
+Results are written to `runs/office/lcsoftcrsid_attention_probe_v1/` and do not
+replace the fixed-weight main method.
+
+## Learnable residual-allocation probe
+
+The monotonic alpha calibrator starts exactly from the fixed frequency-reliability
+formula and learns only three global scalars:
+
+```bash
+bash LCSoftCRSID/scripts/run_office_alpha_probe.sh
+```
+
+Results are written to `runs/office/lcsoftcrsid_alpha_probe_v1/`.

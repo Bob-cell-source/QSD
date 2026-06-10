@@ -139,6 +139,9 @@ def train(args: argparse.Namespace) -> None:
         tail_tau=args.tail_tau,
         residual_scale=args.residual_scale,
         frequency_transform=args.frequency_transform,
+        alpha_mode=args.alpha_mode,
+        candidate_weight_mode=args.candidate_weight_mode,
+        prior_beta_init=args.prior_beta_init,
         disable_semantic_basis=args.disable_semantic_basis,
         disable_shared_residual=args.disable_shared_residual,
         disable_private_residual=args.disable_private_residual,
@@ -152,16 +155,24 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
+        total_rec_loss = 0.0
+        total_attention_kl = 0.0
+        total_attention_entropy = 0.0
         steps = 0
         for sequence, candidates in train_loader:
             sequence = sequence.to(device)
             candidates = candidates.to(device)
-            loss = sampled_cross_entropy(model(sequence, candidates)["score"])
+            output = model(sequence, candidates)
+            rec_loss = sampled_cross_entropy(output["score"])
+            loss = rec_loss + args.attention_kl_weight * output["attention_kl"]
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             total_loss += loss.item()
+            total_rec_loss += rec_loss.item()
+            total_attention_kl += output["attention_kl"].item()
+            total_attention_entropy += output["attention_entropy"].item()
             steps += 1
 
         valid_metrics = evaluate_full_ranking(
@@ -171,7 +182,14 @@ def train(args: argparse.Namespace) -> None:
             num_items=num_items,
             candidate_chunk_size=args.eval_candidate_chunk_size,
         )
-        record = {"epoch": epoch, "loss": total_loss / max(steps, 1), **valid_metrics}
+        record = {
+            "epoch": epoch,
+            "loss": total_loss / max(steps, 1),
+            "rec_loss": total_rec_loss / max(steps, 1),
+            "attention_kl": total_attention_kl / max(steps, 1),
+            "attention_entropy": total_attention_entropy / max(steps, 1),
+            **valid_metrics,
+        }
         history.append(record)
         print(record)
 
@@ -197,6 +215,8 @@ def train(args: argparse.Namespace) -> None:
     result = {
         "test": test_metrics,
         "best_valid_NDCG@10": best_valid,
+        "learned_prior_beta": model.item_encoder.prior_beta(),
+        "learned_alpha_parameters": model.item_encoder.alpha_parameters(),
         "args": vars(args),
     }
     write_json(output_dir / "history.json", history)
@@ -227,6 +247,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tail-tau", type=float, default=20.0)
     parser.add_argument("--residual-scale", type=float, default=1.0)
     parser.add_argument("--frequency-transform", choices=["raw", "log"], default="raw")
+    parser.add_argument(
+        "--alpha-mode",
+        choices=["fixed", "learnable_monotonic"],
+        default="fixed",
+    )
+    parser.add_argument(
+        "--candidate-weight-mode",
+        choices=["fixed", "learned", "prior_guided"],
+        default="fixed",
+    )
+    parser.add_argument("--prior-beta-init", type=float, default=1.0)
+    parser.add_argument("--attention-kl-weight", type=float, default=0.0)
     parser.add_argument("--soft-top-m", type=int, default=4)
     parser.add_argument("--soft-min-overlap-slots", type=int, default=2)
     parser.add_argument("--soft-min-support", type=float, default=0.05)

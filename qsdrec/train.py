@@ -1,6 +1,8 @@
 import argparse
 import math
 import random
+import time
+import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -173,6 +175,7 @@ def build_soft_semantic_table(
     decouple_reliability: bool = False,
     behavior_neighbors: Dict[int, List[int]] | None = None,
     behavior_neighbor_weight: float = 0.0,
+    base_neighbors: Dict[int, List[int]] | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     depth = semantic_table.size(1)
     top_m = max(int(top_m), 1)
@@ -199,18 +202,27 @@ def build_soft_semantic_table(
     reliability = torch.zeros(num_items + 1, dtype=torch.float)
 
     for item in range(1, num_items + 1):
-        sid = item_semantic_ids[item]
-        overlap_counts: Counter[int] = Counter()
-        for slot, code in enumerate(sid):
-            overlap_counts.update(inverted[(slot, int(code))])
-        neighbors = [
-            (neighbor, count)
-            for neighbor, count in overlap_counts.items()
-            if neighbor != item and count >= min_overlap_slots
-        ]
-        neighbors.sort(key=lambda row: row[1], reverse=True)
-        if max_neighbors > 0:
-            neighbors = neighbors[:max_neighbors]
+        if base_neighbors is None:
+            sid = item_semantic_ids[item]
+            overlap_counts: Counter[int] = Counter()
+            for slot, code in enumerate(sid):
+                overlap_counts.update(inverted[(slot, int(code))])
+            neighbors = [
+                (neighbor, count)
+                for neighbor, count in overlap_counts.items()
+                if neighbor != item and count >= min_overlap_slots
+            ]
+            neighbors.sort(key=lambda row: row[1], reverse=True)
+            if max_neighbors > 0:
+                neighbors = neighbors[:max_neighbors]
+        else:
+            neighbors = [
+                (int(neighbor), 1)
+                for neighbor in base_neighbors.get(item, [])
+                if int(neighbor) != item
+            ]
+            if max_neighbors > 0:
+                neighbors = neighbors[:max_neighbors]
         neighbor_weights: Dict[int, float] = {neighbor: 1.0 for neighbor, _ in neighbors}
         if behavior_neighbors is not None and behavior_neighbor_weight > 0.0:
             for neighbor in behavior_neighbors.get(item, []):
@@ -275,6 +287,73 @@ def build_soft_semantic_table(
 
     reliability[0] = 0.0
     return soft_ids, soft_weights, reliability.clamp(0.0, 1.0)
+
+
+def build_text_knn_neighbors(
+    embeddings_path: str | Path,
+    item_ids_path: str | Path,
+    num_items: int,
+    max_neighbors: int,
+    chunk_size: int = 256,
+) -> Tuple[Dict[int, List[int]], Dict[str, float | int | str]]:
+    """Build cosine text neighbors for a controlled softening baseline."""
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("text_knn neighbors require numpy.") from exc
+
+    embeddings = np.load(embeddings_path).astype("float32")
+    raw_item_ids = read_json(item_ids_path)
+    item_ids = [int(item) for item in raw_item_ids]
+    if embeddings.shape[0] != len(item_ids):
+        raise ValueError("Embedding rows and embedding item IDs must have the same length.")
+    if set(item_ids) != set(range(1, num_items + 1)):
+        raise ValueError("Text embedding item IDs must cover every internal item ID exactly once.")
+
+    row_for_item = {item: row for row, item in enumerate(item_ids)}
+    ordered = embeddings[[row_for_item[item] for item in range(1, num_items + 1)]]
+    norms = np.linalg.norm(ordered, axis=1, keepdims=True)
+    ordered = ordered / np.maximum(norms, 1e-12)
+    k = min(max(int(max_neighbors), 1) + 1, num_items)
+    start = time.perf_counter()
+    backend = "chunked_exact_cosine"
+
+    try:
+        import faiss
+
+        index = faiss.IndexFlatIP(ordered.shape[1])
+        index.add(ordered)
+        _, indices = index.search(ordered, k)
+        backend = "faiss_flat_ip"
+    except ImportError:
+        warnings.warn(
+            "faiss is unavailable; text-kNN uses exact chunked cosine search. "
+            "Install faiss for larger item collections.",
+            RuntimeWarning,
+        )
+        indices = np.empty((num_items, k), dtype="int64")
+        chunk_size = max(int(chunk_size), 1)
+        for begin in range(0, num_items, chunk_size):
+            end = min(begin + chunk_size, num_items)
+            scores = ordered[begin:end] @ ordered.T
+            local = np.argpartition(scores, -k, axis=1)[:, -k:]
+            local_scores = np.take_along_axis(scores, local, axis=1)
+            order = np.argsort(local_scores, axis=1)[:, ::-1]
+            indices[begin:end] = np.take_along_axis(local, order, axis=1)
+
+    neighbors: Dict[int, List[int]] = {}
+    for item in range(1, num_items + 1):
+        rows = indices[item - 1]
+        values = [int(row) + 1 for row in rows if int(row) + 1 != item]
+        neighbors[item] = values[:max_neighbors]
+    elapsed = time.perf_counter() - start
+    return neighbors, {
+        "backend": backend,
+        "num_items": num_items,
+        "embedding_dim": int(ordered.shape[1]),
+        "max_neighbors": int(max_neighbors),
+        "elapsed_seconds": elapsed,
+    }
 
 
 def build_log_prior(table: torch.Tensor, num_tokens: int, alpha: float = 1.0) -> torch.Tensor:
@@ -470,7 +549,25 @@ def train(args) -> None:
     soft_semantic_weight = None
     semantic_reliability = None
     behavior_neighbors = None
+    base_neighbors = None
     if args.model_variant in SOFT_SID_VARIANTS:
+        soft_preprocess_start = time.perf_counter()
+        neighbor_report: Dict[str, float | int | str] = {
+            "source": args.cr_soft_neighbor_source,
+        }
+        if args.cr_soft_neighbor_source == "text_knn":
+            if not args.cr_soft_text_embeddings or not args.cr_soft_text_item_ids:
+                raise ValueError(
+                    "text_knn requires --cr-soft-text-embeddings and --cr-soft-text-item-ids."
+                )
+            base_neighbors, text_report = build_text_knn_neighbors(
+                embeddings_path=args.cr_soft_text_embeddings,
+                item_ids_path=args.cr_soft_text_item_ids,
+                num_items=num_items,
+                max_neighbors=args.cr_soft_max_neighbors,
+                chunk_size=args.cr_soft_text_knn_chunk_size,
+            )
+            neighbor_report.update(text_report)
         if args.cr_soft_behavior_weight > 0.0:
             behavior_neighbors = build_behavior_neighbors(
                 sequences=sequences,
@@ -496,6 +593,23 @@ def train(args) -> None:
             decouple_reliability=args.cr_soft_decouple_reliability,
             behavior_neighbors=behavior_neighbors,
             behavior_neighbor_weight=args.cr_soft_behavior_weight,
+            base_neighbors=base_neighbors,
+        )
+        soft_preprocess_elapsed = time.perf_counter() - soft_preprocess_start
+        tensor_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (soft_semantic_table, soft_semantic_weight, semantic_reliability)
+        )
+        write_json(
+            output_dir / "soft_sid_preprocess.json",
+            {
+                **neighbor_report,
+                "total_elapsed_seconds": soft_preprocess_elapsed,
+                "soft_table_bytes": tensor_bytes,
+                "reliability_mean": float(semantic_reliability[1:].mean().item()),
+                "reliability_min": float(semantic_reliability[1:].min().item()),
+                "reliability_max": float(semantic_reliability[1:].max().item()),
+            },
         )
     semantic_token_log_prior = build_log_prior(semantic_table, num_semantic_tokens)
     mini_cluster_table, mini_cluster_log_prior = load_mini_cluster_table(
@@ -776,6 +890,14 @@ def main() -> None:
     parser.add_argument("--cr-soft-hard-token-prior", type=float, default=1.0)
     parser.add_argument("--cr-soft-reliability-floor", type=float, default=0.10)
     parser.add_argument("--cr-soft-max-neighbors", type=int, default=50)
+    parser.add_argument(
+        "--cr-soft-neighbor-source",
+        choices=["sid_overlap", "text_knn"],
+        default="sid_overlap",
+    )
+    parser.add_argument("--cr-soft-text-embeddings", default=None)
+    parser.add_argument("--cr-soft-text-item-ids", default=None)
+    parser.add_argument("--cr-soft-text-knn-chunk-size", type=int, default=256)
     parser.add_argument("--cr-soft-lift-kappa", type=float, default=0.0)
     parser.add_argument("--cr-soft-lift-clip", type=float, default=5.0)
     parser.add_argument("--cr-soft-lift-eps", type=float, default=1e-6)
