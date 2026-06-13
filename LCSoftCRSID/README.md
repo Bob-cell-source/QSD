@@ -76,10 +76,24 @@ The default arguments reproduce the current Transformer main method:
 
 ```text
 dim=128, layers=2, heads=2, dropout=0.2
-tau=20, residual_scale=1.0, frequency_transform=raw
-top_m=4, overlap_slots=2, min_support=0.05
-support_eta=2.0, hard_prior=1.0, reliability_floor=0.1
+tau=20
+top_m=4, overlap_slots=3, min_support=0.05
+quadratic_support, hard_anchor=neighbor_count, reliability_floor=0.1
 max_neighbors=50, random_negatives=100
+candidate_weight_mode=prior_guided, alpha_mode=fixed
+```
+
+## Experimental P-free Candidate Attention
+
+The formal method remains `candidate_weight_mode=prior_guided`. The optional
+`neighborhood_learned` variant keeps the hard token plus the top neighborhood
+tokens, initializes them uniformly, and learns their weights only from the
+recommendation objective. It is isolated as an experiment and does not replace
+the main method unless its validation result is stronger.
+
+```bash
+BATCH_SIZE=256 EVAL_CHUNK_SIZE=256 \
+bash LCSoftCRSID/scripts/run_office_pfree_probe.sh
 ```
 
 The clean implementation intentionally excludes QSDRec, GRU transfer probes,
@@ -97,8 +111,8 @@ bash LCSoftCRSID/scripts/run_office_attention_probe.sh
 
 This compares fixed local weights, attention without a local prior,
 prior-guided attention, and prior-guided attention with weak KL regularization.
-Results are written to `runs/office/lcsoftcrsid_attention_probe_v1/` and do not
-replace the fixed-weight main method.
+Results are written to `runs/office/lcsoftcrsid_attention_probe_v1/`. The final
+method uses prior-guided attention without an auxiliary KL loss.
 
 ## Learnable residual-allocation probe
 
@@ -110,3 +124,4 @@ bash LCSoftCRSID/scripts/run_office_alpha_probe.sh
 ```
 
 Results are written to `runs/office/lcsoftcrsid_alpha_probe_v1/`.
+The final method keeps the deterministic frequency-reliability allocation.

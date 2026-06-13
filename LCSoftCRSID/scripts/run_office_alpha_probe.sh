@@ -45,13 +45,9 @@ run_exp() {
     --grad-clip 5.0 \
     --num-random-negatives 100 \
     --tail-tau 20 \
-    --residual-scale 1.0 \
-    --frequency-transform raw \
     --soft-top-m 4 \
     --soft-min-overlap-slots 2 \
     --soft-min-support 0.05 \
-    --soft-support-eta 1.0 \
-    --soft-hard-token-prior 1.0 \
     --soft-reliability-floor 0.10 \
     --soft-max-neighbors 50 \
     --seed "${SEED}" \
@@ -72,8 +68,6 @@ run_exp "10_learnable_monotonic_alpha" \
 # beats the isolated alpha version on validation NDCG@10.
 run_exp "20_learnable_alpha_prior_attention" \
   --candidate-weight-mode prior_guided \
-  --prior-beta-init 1.0 \
-  --attention-kl-weight 0.0 \
   --alpha-mode learnable_monotonic
 
 "${PYTHON_BIN}" LCSoftCRSID/summarize_alpha_probe.py --root "${OUT_ROOT}"

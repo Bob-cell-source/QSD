@@ -96,21 +96,23 @@ class LCSoftCRSIDItemEncoder(nn.Module):
         dim: int,
         dropout: float,
         tail_tau: float,
-        residual_scale: float,
-        frequency_transform: Literal["raw", "log"] = "raw",
         alpha_mode: Literal["fixed", "learnable_monotonic"] = "fixed",
-        candidate_weight_mode: Literal["fixed", "learned", "prior_guided"] = "fixed",
-        prior_beta_init: float = 1.0,
+        candidate_weight_mode: Literal[
+            "fixed", "learned", "prior_guided", "neighborhood_learned"
+        ] = "prior_guided",
         disable_semantic_basis: bool = False,
         disable_shared_residual: bool = False,
         disable_private_residual: bool = False,
     ) -> None:
         super().__init__()
-        if frequency_transform not in {"raw", "log"}:
-            raise ValueError(f"Unsupported frequency transform: {frequency_transform}")
         if alpha_mode not in {"fixed", "learnable_monotonic"}:
             raise ValueError(f"Unsupported alpha mode: {alpha_mode}")
-        if candidate_weight_mode not in {"fixed", "learned", "prior_guided"}:
+        if candidate_weight_mode not in {
+            "fixed",
+            "learned",
+            "prior_guided",
+            "neighborhood_learned",
+        }:
             raise ValueError(f"Unsupported candidate weight mode: {candidate_weight_mode}")
         if soft_sid_table.shape != soft_sid_weights.shape:
             raise ValueError("Soft SID token and weight tables must have identical shapes.")
@@ -120,13 +122,10 @@ class LCSoftCRSIDItemEncoder(nn.Module):
         self.register_buffer("semantic_reliability", semantic_reliability.float().clamp(0.0, 1.0))
 
         raw_frequency = item_frequency.float().clamp_min(0.0)
-        frequency = raw_frequency
-        if frequency_transform == "log":
-            frequency = torch.log1p(frequency)
-        self.register_buffer("item_frequency", frequency)
+        self.register_buffer("item_frequency", raw_frequency)
         self.register_buffer("has_item_evidence", raw_frequency.gt(0))
         calibrated_tau = float(tail_tau) * self.semantic_reliability.clamp_min(1e-6)
-        private_weight = frequency / (frequency + calibrated_tau)
+        private_weight = raw_frequency / (raw_frequency + calibrated_tau)
         private_weight[0] = 0.0
         self.register_buffer("private_weight", private_weight.clamp(0.0, 1.0))
         if alpha_mode == "learnable_monotonic":
@@ -153,13 +152,12 @@ class LCSoftCRSIDItemEncoder(nn.Module):
             self.selector_query = nn.Linear(dim, dim, bias=False)
             self.selector_key = nn.Linear(dim, dim, bias=False)
             if candidate_weight_mode == "prior_guided":
-                beta = max(float(prior_beta_init), 1e-6)
+                beta = 1.0
                 self.prior_beta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(beta))))
             else:
                 self.register_parameter("prior_beta_raw", None)
         self.output_norm = nn.LayerNorm(dim, eps=1e-8)
         self.dropout = nn.Dropout(dropout)
-        self.residual_scale = float(residual_scale)
         self.alpha_mode = alpha_mode
         self.candidate_weight_mode = candidate_weight_mode
         self.disable_semantic_basis = disable_semantic_basis
@@ -259,7 +257,7 @@ class LCSoftCRSIDItemEncoder(nn.Module):
 
         alpha = self.residual_alpha(items)
         residual = alpha * private + (1.0 - alpha) * shared
-        output = self.output_norm(basis + self.residual_scale * residual)
+        output = self.output_norm(basis + residual)
         output = self.dropout(output) * items.ne(0).unsqueeze(-1)
         return output, attention_kl, attention_entropy
 
@@ -300,11 +298,10 @@ class LCSoftCRSID(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.2,
         tail_tau: float = 20.0,
-        residual_scale: float = 1.0,
-        frequency_transform: Literal["raw", "log"] = "raw",
         alpha_mode: Literal["fixed", "learnable_monotonic"] = "fixed",
-        candidate_weight_mode: Literal["fixed", "learned", "prior_guided"] = "fixed",
-        prior_beta_init: float = 1.0,
+        candidate_weight_mode: Literal[
+            "fixed", "learned", "prior_guided", "neighborhood_learned"
+        ] = "prior_guided",
         disable_semantic_basis: bool = False,
         disable_shared_residual: bool = False,
         disable_private_residual: bool = False,
@@ -329,11 +326,8 @@ class LCSoftCRSID(nn.Module):
             dim=dim,
             dropout=dropout,
             tail_tau=tail_tau,
-            residual_scale=residual_scale,
-            frequency_transform=frequency_transform,
             alpha_mode=alpha_mode,
             candidate_weight_mode=candidate_weight_mode,
-            prior_beta_init=prior_beta_init,
             disable_semantic_basis=disable_semantic_basis,
             disable_shared_residual=disable_shared_residual,
             disable_private_residual=disable_private_residual,

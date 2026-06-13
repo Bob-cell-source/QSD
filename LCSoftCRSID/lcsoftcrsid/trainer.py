@@ -1,6 +1,7 @@
 import argparse
 import random
 from pathlib import Path
+import time
 from typing import Dict, Sequence
 
 import torch
@@ -9,7 +10,13 @@ from torch.utils.data import DataLoader
 from .data import NextItemDataset, RandomNegativeSampler, collate_eval, collate_train
 from .io import read_json, write_json
 from .model import LCSoftCRSID
-from .soft_sid import SoftSIDConfig, build_semantic_table, build_soft_sid_table, build_train_item_frequency
+from .soft_sid import (
+    SoftSIDConfig,
+    build_semantic_table,
+    build_soft_sid_table,
+    build_text_knn_neighbors,
+    build_train_item_frequency,
+)
 
 
 def sampled_cross_entropy(scores: torch.Tensor) -> torch.Tensor:
@@ -85,15 +92,53 @@ def train(args: argparse.Namespace) -> None:
         top_m=args.soft_top_m,
         min_overlap_slots=args.soft_min_overlap_slots,
         min_support=args.soft_min_support,
-        support_eta=args.soft_support_eta,
-        hard_token_prior=args.soft_hard_token_prior,
         reliability_floor=args.soft_reliability_floor,
         max_neighbors=args.soft_max_neighbors,
+        candidate_construction=(
+            "uniform_topk"
+            if args.candidate_weight_mode == "neighborhood_learned"
+            else "local_prior"
+        ),
     )
+    soft_preprocess_start = time.perf_counter()
+    base_neighbors = None
+    neighbor_report: Dict[str, float | int | str] = {
+        "neighbor_source": args.soft_neighbor_source,
+        "candidate_construction": soft_config.candidate_construction,
+    }
+    if args.soft_neighbor_source == "text_knn":
+        if not args.soft_text_embeddings or not args.soft_text_item_ids:
+            raise ValueError(
+                "text_knn requires --soft-text-embeddings and --soft-text-item-ids."
+            )
+        base_neighbors, text_report = build_text_knn_neighbors(
+            embeddings_path=args.soft_text_embeddings,
+            item_ids_path=args.soft_text_item_ids,
+            num_items=num_items,
+            max_neighbors=args.soft_max_neighbors,
+            chunk_size=args.soft_text_knn_chunk_size,
+        )
+        neighbor_report.update(text_report)
     soft_sid_table, soft_sid_weights, reliability = build_soft_sid_table(
         semantic_table=hard_sid_table,
         item_codes=item_codes,
         config=soft_config,
+        base_neighbors=base_neighbors,
+    )
+    tensor_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (soft_sid_table, soft_sid_weights, reliability)
+    )
+    write_json(
+        output_dir / "soft_sid_preprocess.json",
+        {
+            **neighbor_report,
+            "total_elapsed_seconds": time.perf_counter() - soft_preprocess_start,
+            "soft_table_bytes": tensor_bytes,
+            "reliability_mean": float(reliability[1:].mean().item()),
+            "reliability_min": float(reliability[1:].min().item()),
+            "reliability_max": float(reliability[1:].max().item()),
+        },
     )
     item_frequency = build_train_item_frequency(sequences, num_items)
 
@@ -137,11 +182,8 @@ def train(args: argparse.Namespace) -> None:
         num_layers=args.num_layers,
         dropout=args.dropout,
         tail_tau=args.tail_tau,
-        residual_scale=args.residual_scale,
-        frequency_transform=args.frequency_transform,
         alpha_mode=args.alpha_mode,
         candidate_weight_mode=args.candidate_weight_mode,
-        prior_beta_init=args.prior_beta_init,
         disable_semantic_basis=args.disable_semantic_basis,
         disable_shared_residual=args.disable_shared_residual,
         disable_private_residual=args.disable_private_residual,
@@ -164,7 +206,7 @@ def train(args: argparse.Namespace) -> None:
             candidates = candidates.to(device)
             output = model(sequence, candidates)
             rec_loss = sampled_cross_entropy(output["score"])
-            loss = rec_loss + args.attention_kl_weight * output["attention_kl"]
+            loss = rec_loss
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -245,8 +287,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--num-random-negatives", type=int, default=100)
     parser.add_argument("--tail-tau", type=float, default=20.0)
-    parser.add_argument("--residual-scale", type=float, default=1.0)
-    parser.add_argument("--frequency-transform", choices=["raw", "log"], default="raw")
     parser.add_argument(
         "--alpha-mode",
         choices=["fixed", "learnable_monotonic"],
@@ -254,18 +294,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--candidate-weight-mode",
-        choices=["fixed", "learned", "prior_guided"],
-        default="fixed",
+        choices=["fixed", "learned", "prior_guided", "neighborhood_learned"],
+        default="prior_guided",
     )
-    parser.add_argument("--prior-beta-init", type=float, default=1.0)
-    parser.add_argument("--attention-kl-weight", type=float, default=0.0)
     parser.add_argument("--soft-top-m", type=int, default=4)
-    parser.add_argument("--soft-min-overlap-slots", type=int, default=2)
+    parser.add_argument("--soft-min-overlap-slots", type=int, default=3)
     parser.add_argument("--soft-min-support", type=float, default=0.05)
-    parser.add_argument("--soft-support-eta", type=float, default=2.0)
-    parser.add_argument("--soft-hard-token-prior", type=float, default=1.0)
     parser.add_argument("--soft-reliability-floor", type=float, default=0.10)
     parser.add_argument("--soft-max-neighbors", type=int, default=50)
+    parser.add_argument(
+        "--soft-neighbor-source",
+        choices=["sid_overlap", "text_knn"],
+        default="sid_overlap",
+    )
+    parser.add_argument("--soft-text-embeddings")
+    parser.add_argument("--soft-text-item-ids")
+    parser.add_argument("--soft-text-knn-chunk-size", type=int, default=256)
     parser.add_argument("--disable-semantic-basis", action="store_true")
     parser.add_argument("--disable-shared-residual", action="store_true")
     parser.add_argument("--disable-private-residual", action="store_true")

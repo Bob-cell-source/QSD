@@ -26,13 +26,11 @@ DEVICE="${DEVICE:-cuda}"
   --grad-clip 5.0 \
   --num-random-negatives 100 \
   --tail-tau 20 \
-  --residual-scale 1.0 \
-  --frequency-transform raw \
   --soft-top-m 4 \
-  --soft-min-overlap-slots 2 \
+  --soft-min-overlap-slots 3 \
   --soft-min-support 0.05 \
-  --soft-support-eta 2.0 \
-  --soft-hard-token-prior 1.0 \
   --soft-reliability-floor 0.10 \
   --soft-max-neighbors 50 \
+  --candidate-weight-mode prior_guided \
+  --alpha-mode fixed \
   --seed "${SEED:-2026}"

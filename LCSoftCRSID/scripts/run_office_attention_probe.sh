@@ -45,13 +45,9 @@ run_exp() {
     --grad-clip 5.0 \
     --num-random-negatives 100 \
     --tail-tau 20 \
-    --residual-scale 1.0 \
-    --frequency-transform raw \
     --soft-top-m 4 \
     --soft-min-overlap-slots 2 \
     --soft-min-support 0.05 \
-    --soft-support-eta 1.0 \
-    --soft-hard-token-prior 1.0 \
     --soft-reliability-floor 0.10 \
     --soft-max-neighbors 50 \
     --seed "${SEED}" \
@@ -60,24 +56,14 @@ run_exp() {
 
 # Exact fixed-weight control under the clean implementation.
 run_exp "00_fixed_local_weights" \
-  --candidate-weight-mode fixed \
-  --attention-kl-weight 0.0
+  --candidate-weight-mode fixed
 
 # Learns candidate weights only from recommendation supervision.
 run_exp "10_learned_without_prior" \
-  --candidate-weight-mode learned \
-  --attention-kl-weight 0.0
+  --candidate-weight-mode learned
 
 # Learns candidate weights while retaining local support as a log-prior bias.
 run_exp "20_prior_guided" \
-  --candidate-weight-mode prior_guided \
-  --prior-beta-init 1.0 \
-  --attention-kl-weight 0.0
-
-# Tests whether a weak prior-preserving regularizer improves stability.
-run_exp "21_prior_guided_kl1e3" \
-  --candidate-weight-mode prior_guided \
-  --prior-beta-init 1.0 \
-  --attention-kl-weight 0.001
+  --candidate-weight-mode prior_guided
 
 "${PYTHON_BIN}" LCSoftCRSID/summarize_attention_probe.py --root "${OUT_ROOT}"
