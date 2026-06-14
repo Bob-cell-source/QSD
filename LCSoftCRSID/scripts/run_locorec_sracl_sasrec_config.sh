@@ -20,7 +20,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${DATASET_DIR}/sracl_locorec_compatible/seed${SEED}}"
   --batch-size 256 \
   --eval-candidate-chunk-size "${EVAL_CHUNK_SIZE:-1024}" \
   --max-len 20 \
-  --dim 64 \
+  --dim 128 \
   --num-heads 2 \
   --num-layers 2 \
   --dropout 0.5 \
