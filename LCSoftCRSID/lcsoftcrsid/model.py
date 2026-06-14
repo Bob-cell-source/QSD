@@ -97,6 +97,12 @@ class LCSoftCRSIDItemEncoder(nn.Module):
         dropout: float,
         tail_tau: float,
         alpha_mode: Literal["fixed", "learnable_monotonic"] = "fixed",
+        fusion_mode: Literal[
+            "fixed", "prior_guided_gate", "hierarchical_residual_gate"
+        ] = "fixed",
+        residual_scale: float = 1.0,
+        gate_correction_scale: float = 1.0,
+        gate_private_margin: float = 0.0,
         candidate_weight_mode: Literal[
             "fixed", "learned", "prior_guided", "neighborhood_learned"
         ] = "prior_guided",
@@ -107,6 +113,14 @@ class LCSoftCRSIDItemEncoder(nn.Module):
         super().__init__()
         if alpha_mode not in {"fixed", "learnable_monotonic"}:
             raise ValueError(f"Unsupported alpha mode: {alpha_mode}")
+        if fusion_mode not in {
+            "fixed",
+            "prior_guided_gate",
+            "hierarchical_residual_gate",
+        }:
+            raise ValueError(f"Unsupported fusion mode: {fusion_mode}")
+        if residual_scale <= 0:
+            raise ValueError("residual_scale must be positive.")
         if candidate_weight_mode not in {
             "fixed",
             "learned",
@@ -156,15 +170,59 @@ class LCSoftCRSIDItemEncoder(nn.Module):
                 self.prior_beta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(beta))))
             else:
                 self.register_parameter("prior_beta_raw", None)
+        if fusion_mode != "fixed":
+            prior = self.soft_sid_weights.clamp_min(0.0)
+            prior_entropy = -(prior * torch.log(prior.clamp_min(1e-8))).sum(dim=-1)
+            max_entropy = math.log(max(prior.size(-1), 2))
+            prior_entropy = prior_entropy.mean(dim=-1) / max(max_entropy, 1e-8)
+            active_ratio = prior.gt(0).float().mean(dim=(-1, -2))
+            log_frequency = torch.log1p(raw_frequency)
+            valid_frequency = log_frequency[1:]
+            frequency_mean = valid_frequency.mean()
+            frequency_std = valid_frequency.std(unbiased=False).clamp_min(1e-6)
+            gate_features = torch.stack(
+                [
+                    (log_frequency - frequency_mean) / frequency_std,
+                    self.semantic_reliability,
+                    prior_entropy,
+                    active_ratio,
+                ],
+                dim=-1,
+            )
+            gate_features[0].zero_()
+            self.register_buffer("gate_features", gate_features, persistent=False)
+            self.fusion_gate = None
+        else:
+            self.register_buffer("gate_features", torch.empty(0), persistent=False)
+            self.fusion_gate = None
         self.output_norm = nn.LayerNorm(dim, eps=1e-8)
         self.dropout = nn.Dropout(dropout)
         self.alpha_mode = alpha_mode
+        self.fusion_mode = fusion_mode
+        self.residual_scale = float(residual_scale)
+        self.gate_correction_scale = float(gate_correction_scale)
+        self.gate_private_margin = float(gate_private_margin)
         self.candidate_weight_mode = candidate_weight_mode
         self.disable_semantic_basis = disable_semantic_basis
         self.disable_shared_residual = disable_shared_residual
         self.disable_private_residual = disable_private_residual
         self.dim = dim
         self._reset_parameters()
+        if fusion_mode != "fixed":
+            # Build the additional module after initializing the common model
+            # so fixed and gated variants share identical initial parameters.
+            gate_hidden = max(8, dim // 8)
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(4, gate_hidden),
+                nn.GELU(),
+                nn.Linear(
+                    gate_hidden,
+                    2 if fusion_mode == "hierarchical_residual_gate" else 3,
+                ),
+            )
+            with torch.no_grad():
+                self.fusion_gate[-1].weight.zero_()
+                self.fusion_gate[-1].bias.zero_()
 
     def _reset_parameters(self) -> None:
         for parameter in self.parameters():
@@ -244,7 +302,126 @@ class LCSoftCRSIDItemEncoder(nn.Module):
         alpha = alpha * self.has_item_evidence[items]
         return alpha.unsqueeze(-1)
 
-    def encode_with_aux(self, items: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def fusion_weights(
+        self, items: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        alpha = self.residual_alpha(items).squeeze(-1)
+        valid_item = items.ne(0)
+
+        if self.fusion_mode == "hierarchical_residual_gate":
+            correction = self.gate_correction_scale * torch.tanh(
+                self.fusion_gate(self.gate_features[items])
+            )
+            gamma_prior = alpha.new_full(
+                alpha.shape,
+                self.residual_scale / (1.0 + self.residual_scale),
+            ).clamp(1e-6, 1.0 - 1e-6)
+            alpha_prior = alpha.clamp(1e-6, 1.0 - 1e-6)
+            gamma = torch.sigmoid(
+                torch.logit(gamma_prior) + correction[..., 0]
+            )
+            learned_alpha = torch.sigmoid(
+                torch.logit(alpha_prior) + correction[..., 1]
+            )
+            learned_alpha = learned_alpha * self.has_item_evidence[items]
+
+            # gamma is a normalized residual share. Converting it to odds
+            # preserves the original b + lambda*r parameterization exactly.
+            effective_scale = gamma / (1.0 - gamma).clamp_min(1e-6)
+            basis_weight = torch.ones_like(gamma)
+            shared_weight = effective_scale * (1.0 - learned_alpha)
+            private_weight = effective_scale * learned_alpha
+            if self.disable_semantic_basis:
+                basis_weight = torch.zeros_like(basis_weight)
+            if self.disable_shared_residual:
+                shared_weight = torch.zeros_like(shared_weight)
+            if self.disable_private_residual:
+                private_weight = torch.zeros_like(private_weight)
+            weights = torch.stack(
+                [basis_weight, shared_weight, private_weight], dim=-1
+            ) * valid_item.unsqueeze(-1)
+
+            def bernoulli_kl(value: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+                value = value.clamp(1e-8, 1.0 - 1e-8)
+                prior = prior.clamp(1e-8, 1.0 - 1e-8)
+                return value * torch.log(value / prior) + (1.0 - value) * torch.log(
+                    (1.0 - value) / (1.0 - prior)
+                )
+
+            gamma_kl = bernoulli_kl(gamma, gamma_prior)
+            alpha_kl = bernoulli_kl(learned_alpha, alpha_prior)
+            alpha_mask = valid_item & self.has_item_evidence[items]
+            gate_kl = (
+                (gamma_kl * valid_item).sum()
+                + (alpha_kl * alpha_mask).sum()
+            ) / (valid_item.sum() + alpha_mask.sum()).clamp_min(1)
+
+            tail_weight = (1.0 - alpha).detach()
+            private_excess = torch.relu(
+                learned_alpha - alpha - self.gate_private_margin
+            )
+            private_penalty = (
+                private_excess.square() * tail_weight * valid_item
+            ).sum() / valid_item.sum().clamp_min(1)
+            return weights, gate_kl.clamp_min(0.0), private_penalty
+
+        basis_prior = torch.ones_like(alpha)
+        shared_prior = 1.0 - alpha
+        private_prior = alpha
+        prior = torch.stack([basis_prior, shared_prior, private_prior], dim=-1)
+
+        component_mask = torch.ones_like(prior, dtype=torch.bool)
+        if self.disable_semantic_basis:
+            component_mask[..., 0] = False
+        if self.disable_shared_residual:
+            component_mask[..., 1] = False
+        if self.disable_private_residual:
+            component_mask[..., 2] = False
+        component_mask[..., 2] &= self.has_item_evidence[items]
+        component_mask &= valid_item.unsqueeze(-1)
+
+        prior = prior * component_mask
+        if self.fusion_mode == "fixed":
+            zero = prior.new_tensor(0.0)
+            return prior, zero, zero
+
+        prior = prior / prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        correction = self.gate_correction_scale * torch.tanh(
+            self.fusion_gate(self.gate_features[items])
+        )
+        logits = torch.log(prior.clamp_min(1e-8)) + correction
+        logits = logits.masked_fill(~component_mask, -1e9)
+        logits = torch.where(valid_item.unsqueeze(-1), logits, torch.zeros_like(logits))
+        weights = torch.softmax(logits, dim=-1) * component_mask
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        log_weights = torch.log(weights.clamp_min(1e-8))
+        log_prior = torch.log(prior.clamp_min(1e-8))
+        item_kl = (weights * (log_weights - log_prior) * component_mask).sum(dim=-1)
+        gate_kl = (item_kl * valid_item).sum() / valid_item.sum().clamp_min(1)
+
+        # Low-frequency items have weak private-ID supervision. Penalize only
+        # the amount by which the learned private weight exceeds its prior.
+        tail_weight = (1.0 - alpha).detach()
+        private_excess = torch.relu(
+            weights[..., 2] - prior[..., 2] - self.gate_private_margin
+        )
+        private_penalty = (
+            private_excess.square() * tail_weight * valid_item
+        ).sum() / valid_item.sum().clamp_min(1)
+        return weights, gate_kl.clamp_min(0.0), private_penalty
+
+    def encode_with_aux(
+        self, items: torch.Tensor
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         candidate_weights, attention_kl, attention_entropy = self.candidate_weights(items)
         zeros = items.new_zeros((*items.shape, self.dim), dtype=torch.float)
         basis = zeros if self.disable_semantic_basis else self.basis_projection(
@@ -255,14 +432,67 @@ class LCSoftCRSIDItemEncoder(nn.Module):
         )
         private = zeros if self.disable_private_residual else self.private_residual_embedding(items)
 
-        alpha = self.residual_alpha(items)
-        residual = alpha * private + (1.0 - alpha) * shared
-        output = self.output_norm(basis + residual)
+        fusion_weights, gate_kl, gate_private_penalty = self.fusion_weights(items)
+        output = self.output_norm(
+            fusion_weights[..., 0:1] * basis
+            + fusion_weights[..., 1:2] * shared
+            + fusion_weights[..., 2:3] * private
+        )
         output = self.dropout(output) * items.ne(0).unsqueeze(-1)
-        return output, attention_kl, attention_entropy
+        valid = items.ne(0).float()
+        gate_mean = (fusion_weights * valid.unsqueeze(-1)).sum(
+            dim=tuple(range(fusion_weights.ndim - 1))
+        ) / valid.sum().clamp_min(1.0)
+        return (
+            output,
+            attention_kl,
+            attention_entropy,
+            gate_kl,
+            gate_private_penalty,
+            gate_mean,
+        )
 
     def forward(self, items: torch.Tensor) -> torch.Tensor:
         return self.encode_with_aux(items)[0]
+
+    @torch.no_grad()
+    def gate_statistics(self) -> Dict[str, float] | None:
+        if self.fusion_mode == "fixed":
+            return None
+        items = torch.arange(1, self.item_frequency.numel(), device=self.item_frequency.device)
+        weights, gate_kl, private_penalty = self.fusion_weights(items)
+        mean = weights.mean(dim=0)
+        statistics = {
+            "semantic_basis": float(mean[0].cpu()),
+            "shared_residual": float(mean[1].cpu()),
+            "private_residual": float(mean[2].cpu()),
+            "catalog_kl": float(gate_kl.cpu()),
+            "catalog_private_penalty": float(private_penalty.cpu()),
+        }
+        if self.fusion_mode == "hierarchical_residual_gate":
+            correction = self.gate_correction_scale * torch.tanh(
+                self.fusion_gate(self.gate_features[items])
+            )
+            alpha_prior = self.residual_alpha(items).squeeze(-1)
+            gamma_prior_value = self.residual_scale / (1.0 + self.residual_scale)
+            gamma_prior = alpha_prior.new_full(
+                alpha_prior.shape, gamma_prior_value
+            ).clamp(1e-6, 1.0 - 1e-6)
+            gamma = torch.sigmoid(torch.logit(gamma_prior) + correction[..., 0])
+            learned_alpha = torch.sigmoid(
+                torch.logit(alpha_prior.clamp(1e-6, 1.0 - 1e-6))
+                + correction[..., 1]
+            ) * self.has_item_evidence[items]
+            statistics.update(
+                {
+                    "residual_share_gamma": float(gamma.mean().cpu()),
+                    "shared_private_alpha": float(learned_alpha.mean().cpu()),
+                    "effective_residual_scale": float(
+                        (gamma / (1.0 - gamma).clamp_min(1e-6)).mean().cpu()
+                    ),
+                }
+            )
+        return statistics
 
     def prior_beta(self) -> float | None:
         if self.prior_beta_raw is None:
@@ -299,6 +529,12 @@ class LCSoftCRSID(nn.Module):
         dropout: float = 0.2,
         tail_tau: float = 20.0,
         alpha_mode: Literal["fixed", "learnable_monotonic"] = "fixed",
+        fusion_mode: Literal[
+            "fixed", "prior_guided_gate", "hierarchical_residual_gate"
+        ] = "fixed",
+        residual_scale: float = 1.0,
+        gate_correction_scale: float = 1.0,
+        gate_private_margin: float = 0.0,
         candidate_weight_mode: Literal[
             "fixed", "learned", "prior_guided", "neighborhood_learned"
         ] = "prior_guided",
@@ -327,18 +563,71 @@ class LCSoftCRSID(nn.Module):
             dropout=dropout,
             tail_tau=tail_tau,
             alpha_mode=alpha_mode,
+            fusion_mode=fusion_mode,
+            residual_scale=residual_scale,
+            gate_correction_scale=gate_correction_scale,
+            gate_private_margin=gate_private_margin,
             candidate_weight_mode=candidate_weight_mode,
             disable_semantic_basis=disable_semantic_basis,
             disable_shared_residual=disable_shared_residual,
             disable_private_residual=disable_private_residual,
         )
     def forward(self, sequence: torch.Tensor, candidates: torch.Tensor) -> Dict[str, torch.Tensor]:
-        sequence_vectors, sequence_kl, sequence_entropy = self.item_encoder.encode_with_aux(sequence)
+        (
+            sequence_vectors,
+            sequence_kl,
+            sequence_entropy,
+            sequence_gate_kl,
+            sequence_private_penalty,
+            sequence_gate_mean,
+        ) = self.item_encoder.encode_with_aux(sequence)
         user_vector, _ = self.sequence_encoder(sequence, sequence_vectors)
-        candidate_vectors, candidate_kl, candidate_entropy = self.item_encoder.encode_with_aux(candidates)
+        (
+            candidate_vectors,
+            candidate_kl,
+            candidate_entropy,
+            candidate_gate_kl,
+            candidate_private_penalty,
+            candidate_gate_mean,
+        ) = self.item_encoder.encode_with_aux(candidates)
         scores = torch.einsum("bd,bcd->bc", user_vector, candidate_vectors)
         return {
             "score": scores,
             "attention_kl": 0.5 * (sequence_kl + candidate_kl),
             "attention_entropy": 0.5 * (sequence_entropy + candidate_entropy),
+            "gate_kl": 0.5 * (sequence_gate_kl + candidate_gate_kl),
+            "gate_private_penalty": 0.5
+            * (sequence_private_penalty + candidate_private_penalty),
+            "gate_mean": 0.5 * (sequence_gate_mean + candidate_gate_mean),
+        }
+
+    def full_catalog_forward(
+        self, sequence: torch.Tensor, catalog_items: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        (
+            sequence_vectors,
+            sequence_kl,
+            sequence_entropy,
+            sequence_gate_kl,
+            sequence_private_penalty,
+            sequence_gate_mean,
+        ) = self.item_encoder.encode_with_aux(sequence)
+        user_vector, _ = self.sequence_encoder(sequence, sequence_vectors)
+        (
+            catalog_vectors,
+            catalog_kl,
+            catalog_entropy,
+            catalog_gate_kl,
+            catalog_private_penalty,
+            catalog_gate_mean,
+        ) = self.item_encoder.encode_with_aux(catalog_items)
+        scores = user_vector @ catalog_vectors.transpose(0, 1)
+        return {
+            "score": scores,
+            "attention_kl": 0.5 * (sequence_kl + catalog_kl),
+            "attention_entropy": 0.5 * (sequence_entropy + catalog_entropy),
+            "gate_kl": 0.5 * (sequence_gate_kl + catalog_gate_kl),
+            "gate_private_penalty": 0.5
+            * (sequence_private_penalty + catalog_private_penalty),
+            "gate_mean": 0.5 * (sequence_gate_mean + catalog_gate_mean),
         }

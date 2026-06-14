@@ -448,6 +448,7 @@ def full_softmax_loss(
     num_items: int,
     sem_weight: float,
     candidate_chunk_size: int,
+    mask_seen_items: bool = True,
 ) -> torch.Tensor:
     batch_size = seq.size(0)
     all_items = torch.arange(1, num_items + 1, dtype=torch.long, device=seq.device)
@@ -459,7 +460,7 @@ def full_softmax_loss(
     scores = torch.cat(score_chunks, dim=1)
 
     seen_mask = seq.gt(0)
-    if seen_mask.any():
+    if mask_seen_items and seen_mask.any():
         history_rows, history_cols = seen_mask.nonzero(as_tuple=True)
         history_item_idx = seq[history_rows, history_cols] - 1
         scores[history_rows, history_item_idx] = float("-inf")
@@ -477,10 +478,12 @@ def evaluate_full_ranking(
     sem_weight: float,
     ks: Sequence[int] = (5, 10, 20),
     batch_eval_size: int = 1024,
+    mask_seen_items: bool = True,
 ) -> Dict[str, float]:
     model.eval()
     hits = {k: 0.0 for k in ks}
     ndcgs = {k: 0.0 for k in ks}
+    mrrs = {k: 0.0 for k in ks}
     total = 0
 
     all_items = torch.arange(1, num_items + 1, dtype=torch.long, device=device)
@@ -502,7 +505,7 @@ def evaluate_full_ranking(
         # Exclude historical interactions so evaluation follows leave-one-out
         # full ranking instead of rewarding already-consumed items.
         seen_mask = seq.gt(0)
-        if seen_mask.any():
+        if mask_seen_items and seen_mask.any():
             history_rows, history_cols = seen_mask.nonzero(as_tuple=True)
             history_item_idx = seq[history_rows, history_cols] - 1
             scores[history_rows, history_item_idx] = float("-inf")
@@ -519,6 +522,7 @@ def evaluate_full_ranking(
             pos = match.float().argmax(dim=1) + 1
             ndcg = hit.float() / torch.log2(pos.float() + 1.0)
             ndcgs[k] += ndcg.sum().item()
+            mrrs[k] += (hit.float() / pos.float()).sum().item()
 
         total += batch_size
 
@@ -529,6 +533,7 @@ def evaluate_full_ranking(
         result[f"HR@{k}"] = hr
         result[f"Recall@{k}"] = hr
         result[f"NDCG@{k}"] = ndcg
+        result[f"MRR@{k}"] = mrrs[k] / max(total, 1)
     return result
 
 
@@ -741,6 +746,7 @@ def train(args) -> None:
                     num_items=num_items,
                     sem_weight=args.sem_weight,
                     candidate_chunk_size=args.train_candidate_chunk_size,
+                    mask_seen_items=not args.keep_seen_items,
                 )
                 if args.model_variant == "qsdrec" and args.div_weight > 0:
                     h_id, _ = model.encoder(seq)
@@ -777,11 +783,12 @@ def train(args) -> None:
             sem_weight=args.sem_weight,
             ks=(5, 10, 20),
             batch_eval_size=args.eval_batch_eval_size,
+            mask_seen_items=not args.keep_seen_items,
         )
         row = {"epoch": epoch, "loss": total_loss / max(steps, 1), **valid}
         history.append(row)
         print(row)
-        metric = valid.get("NDCG@10", 0.0)
+        metric = valid.get(args.early_stop_metric, 0.0)
         if metric > best_metric:
             best_metric = metric
             bad_epochs = 0
@@ -793,7 +800,8 @@ def train(args) -> None:
                     {
                         "early_stop": True,
                         "epoch": epoch,
-                        "best_valid_NDCG@10": best_metric,
+                        "early_stop_metric": args.early_stop_metric,
+                        "best_valid_metric": best_metric,
                         "patience": args.early_stop_patience,
                     }
                 )
@@ -813,10 +821,14 @@ def train(args) -> None:
             sem_weight=args.sem_weight,
             ks=(5, 10, 20),
             batch_eval_size=args.eval_batch_eval_size,
+            mask_seen_items=not args.keep_seen_items,
         )
+    best_valid_ndcg = max((row.get("NDCG@10", 0.0) for row in history), default=0.0)
     result = {
         "test": test,
-        "best_valid_NDCG@10": best_metric,
+        "best_valid_NDCG@10": best_valid_ndcg,
+        "early_stop_metric": args.early_stop_metric,
+        "best_valid_metric": best_metric,
         "test_evaluated": not args.skip_test_evaluation,
         "args": vars(args),
     }
@@ -919,6 +931,16 @@ def main() -> None:
     parser.add_argument("--train-candidate-chunk-size", type=int, default=4096)
     parser.add_argument("--eval-batch-eval-size", type=int, default=1024)
     parser.add_argument("--early-stop-patience", type=int, default=10)
+    parser.add_argument(
+        "--early-stop-metric",
+        choices=["NDCG@10", "MRR@10"],
+        default="NDCG@10",
+    )
+    parser.add_argument(
+        "--keep-seen-items",
+        action="store_true",
+        help="Keep previously interacted items in full-softmax training and ranking.",
+    )
     parser.add_argument(
         "--skip-test-evaluation",
         action="store_true",

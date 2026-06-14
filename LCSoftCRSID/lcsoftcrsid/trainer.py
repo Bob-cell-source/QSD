@@ -32,10 +32,12 @@ def evaluate_full_ranking(
     num_items: int,
     candidate_chunk_size: int,
     cutoffs: Sequence[int] = (5, 10, 20),
+    mask_seen_items: bool = True,
 ) -> Dict[str, float]:
     model.eval()
     hits = {cutoff: 0.0 for cutoff in cutoffs}
     ndcgs = {cutoff: 0.0 for cutoff in cutoffs}
+    mrrs = {cutoff: 0.0 for cutoff in cutoffs}
     total = 0
     all_items = torch.arange(1, num_items + 1, device=device)
     max_cutoff = max(cutoffs)
@@ -52,7 +54,7 @@ def evaluate_full_ranking(
         scores = torch.cat(score_chunks, dim=1)
 
         seen_mask = sequences.gt(0)
-        if seen_mask.any():
+        if mask_seen_items and seen_mask.any():
             rows, columns = seen_mask.nonzero(as_tuple=True)
             scores[rows, sequences[rows, columns] - 1] = float("-inf")
 
@@ -64,6 +66,7 @@ def evaluate_full_ranking(
             hits[cutoff] += hit.float().sum().item()
             rank = matches.float().argmax(dim=1) + 1
             ndcgs[cutoff] += (hit.float() / torch.log2(rank.float() + 1.0)).sum().item()
+            mrrs[cutoff] += (hit.float() / rank.float()).sum().item()
         total += batch_size
 
     metrics: Dict[str, float] = {}
@@ -71,6 +74,7 @@ def evaluate_full_ranking(
         metrics[f"HR@{cutoff}"] = hits[cutoff] / max(total, 1)
         metrics[f"Recall@{cutoff}"] = metrics[f"HR@{cutoff}"]
         metrics[f"NDCG@{cutoff}"] = ndcgs[cutoff] / max(total, 1)
+        metrics[f"MRR@{cutoff}"] = mrrs[cutoff] / max(total, 1)
     return metrics
 
 
@@ -146,12 +150,17 @@ def train(args: argparse.Namespace) -> None:
     valid_dataset = NextItemDataset(sequences, args.max_len, "valid")
     test_dataset = NextItemDataset(sequences, args.max_len, "test")
     sampler = RandomNegativeSampler(num_items, args.num_random_negatives)
+    train_collate = (
+        collate_eval
+        if args.train_objective == "full_softmax"
+        else lambda batch: collate_train(batch, sampler)
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=lambda batch: collate_train(batch, sampler),
+        collate_fn=train_collate,
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -183,12 +192,35 @@ def train(args: argparse.Namespace) -> None:
         dropout=args.dropout,
         tail_tau=args.tail_tau,
         alpha_mode=args.alpha_mode,
+        fusion_mode=args.fusion_mode,
+        residual_scale=args.residual_scale,
+        gate_correction_scale=args.gate_correction_scale,
+        gate_private_margin=args.gate_private_margin,
         candidate_weight_mode=args.candidate_weight_mode,
         disable_semantic_basis=args.disable_semantic_basis,
         disable_shared_residual=args.disable_shared_residual,
         disable_private_residual=args.disable_private_residual,
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    gate_parameters = (
+        list(model.item_encoder.fusion_gate.parameters())
+        if model.item_encoder.fusion_gate is not None
+        else []
+    )
+    gate_parameter_ids = {id(parameter) for parameter in gate_parameters}
+    base_parameters = [
+        parameter for parameter in model.parameters() if id(parameter) not in gate_parameter_ids
+    ]
+    parameter_groups = [{"params": base_parameters, "lr": args.lr}]
+    if gate_parameters:
+        parameter_groups.append(
+            {"params": gate_parameters, "lr": args.lr * args.gate_lr_scale}
+        )
+    optimizer = torch.optim.AdamW(
+        parameter_groups,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    catalog_items = torch.arange(1, num_items + 1, device=device)
 
     best_valid = -1.0
     best_path = output_dir / "best.pt"
@@ -196,17 +228,38 @@ def train(args: argparse.Namespace) -> None:
     stale_epochs = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
+        gate_trainable = epoch > args.gate_warmup_epochs
+        for parameter in gate_parameters:
+            parameter.requires_grad_(gate_trainable)
         total_loss = 0.0
         total_rec_loss = 0.0
         total_attention_kl = 0.0
         total_attention_entropy = 0.0
+        total_gate_kl = 0.0
+        total_gate_private_penalty = 0.0
+        total_gate_mean = torch.zeros(3)
         steps = 0
         for sequence, candidates in train_loader:
             sequence = sequence.to(device)
             candidates = candidates.to(device)
-            output = model(sequence, candidates)
-            rec_loss = sampled_cross_entropy(output["score"])
-            loss = rec_loss
+            if args.train_objective == "full_softmax":
+                output = model.full_catalog_forward(sequence, catalog_items)
+                if not args.keep_seen_items:
+                    seen_mask = sequence.gt(0)
+                    if seen_mask.any():
+                        rows, columns = seen_mask.nonzero(as_tuple=True)
+                        output["score"][rows, sequence[rows, columns] - 1] = float("-inf")
+                rec_loss = torch.nn.functional.cross_entropy(
+                    output["score"], candidates - 1
+                )
+            else:
+                output = model(sequence, candidates)
+                rec_loss = sampled_cross_entropy(output["score"])
+            loss = (
+                rec_loss
+                + args.gate_kl_weight * output["gate_kl"]
+                + args.gate_private_weight * output["gate_private_penalty"]
+            )
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -215,6 +268,9 @@ def train(args: argparse.Namespace) -> None:
             total_rec_loss += rec_loss.item()
             total_attention_kl += output["attention_kl"].item()
             total_attention_entropy += output["attention_entropy"].item()
+            total_gate_kl += output["gate_kl"].item()
+            total_gate_private_penalty += output["gate_private_penalty"].item()
+            total_gate_mean += output["gate_mean"].detach().cpu()
             steps += 1
 
         valid_metrics = evaluate_full_ranking(
@@ -223,6 +279,7 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             num_items=num_items,
             candidate_chunk_size=args.eval_candidate_chunk_size,
+            mask_seen_items=not args.keep_seen_items,
         )
         record = {
             "epoch": epoch,
@@ -230,18 +287,25 @@ def train(args: argparse.Namespace) -> None:
             "rec_loss": total_rec_loss / max(steps, 1),
             "attention_kl": total_attention_kl / max(steps, 1),
             "attention_entropy": total_attention_entropy / max(steps, 1),
+            "gate_kl": total_gate_kl / max(steps, 1),
+            "gate_private_penalty": total_gate_private_penalty / max(steps, 1),
+            "gate_trainable": gate_trainable,
+            "gate_basis": float(total_gate_mean[0] / max(steps, 1)),
+            "gate_shared": float(total_gate_mean[1] / max(steps, 1)),
+            "gate_private": float(total_gate_mean[2] / max(steps, 1)),
             **valid_metrics,
         }
         history.append(record)
         print(record)
 
-        valid_ndcg = valid_metrics["NDCG@10"]
-        if valid_ndcg > best_valid:
-            best_valid = valid_ndcg
+        valid_metric = valid_metrics[args.early_stop_metric]
+        if valid_metric > best_valid:
+            best_valid = valid_metric
             stale_epochs = 0
             torch.save({"model": model.state_dict(), "args": vars(args)}, best_path)
         else:
-            stale_epochs += 1
+            # Do not consume early-stopping patience before the gate is opened.
+            stale_epochs = 0 if not gate_trainable else stale_epochs + 1
             if stale_epochs >= args.early_stop_patience:
                 break
 
@@ -253,12 +317,17 @@ def train(args: argparse.Namespace) -> None:
         device=device,
         num_items=num_items,
         candidate_chunk_size=args.eval_candidate_chunk_size,
+        mask_seen_items=not args.keep_seen_items,
     )
+    best_valid_ndcg = max((row.get("NDCG@10", 0.0) for row in history), default=0.0)
     result = {
         "test": test_metrics,
-        "best_valid_NDCG@10": best_valid,
+        "best_valid_NDCG@10": best_valid_ndcg,
+        "early_stop_metric": args.early_stop_metric,
+        "best_valid_metric": best_valid,
         "learned_prior_beta": model.item_encoder.prior_beta(),
         "learned_alpha_parameters": model.item_encoder.alpha_parameters(),
+        "learned_gate_statistics": model.item_encoder.gate_statistics(),
         "args": vars(args),
     }
     write_json(output_dir / "history.json", history)
@@ -274,6 +343,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--early-stop-patience", type=int, default=10)
+    parser.add_argument(
+        "--early-stop-metric",
+        choices=["NDCG@10", "MRR@10"],
+        default="NDCG@10",
+    )
+    parser.add_argument(
+        "--keep-seen-items",
+        action="store_true",
+        help="Keep previously interacted items in full-softmax training and ranking.",
+    )
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--eval-candidate-chunk-size", type=int, default=2048)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -286,12 +365,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--num-random-negatives", type=int, default=100)
+    parser.add_argument(
+        "--train-objective",
+        choices=["sampled", "full_softmax"],
+        default="sampled",
+    )
     parser.add_argument("--tail-tau", type=float, default=20.0)
     parser.add_argument(
         "--alpha-mode",
         choices=["fixed", "learnable_monotonic"],
         default="fixed",
     )
+    parser.add_argument(
+        "--fusion-mode",
+        choices=["fixed", "prior_guided_gate", "hierarchical_residual_gate"],
+        default="fixed",
+    )
+    parser.add_argument("--residual-scale", type=float, default=1.0)
+    parser.add_argument("--gate-kl-weight", type=float, default=0.0)
+    parser.add_argument("--gate-private-weight", type=float, default=0.0)
+    parser.add_argument("--gate-private-margin", type=float, default=0.0)
+    parser.add_argument("--gate-correction-scale", type=float, default=1.0)
+    parser.add_argument("--gate-warmup-epochs", type=int, default=0)
+    parser.add_argument("--gate-lr-scale", type=float, default=1.0)
     parser.add_argument(
         "--candidate-weight-mode",
         choices=["fixed", "learned", "prior_guided", "neighborhood_learned"],
