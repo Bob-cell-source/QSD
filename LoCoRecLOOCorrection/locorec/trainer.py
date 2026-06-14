@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from .data import NextItemDataset, RandomNegativeSampler, collate_eval, collate_train
 from .io import read_json, write_json
-from .model import LoCoRec
+from .model import HardSIDFusion, LoCoRec
 from .soft_sid import (
     SoftSIDConfig,
     build_semantic_table,
@@ -97,46 +97,59 @@ def train(args: argparse.Namespace) -> None:
     hard_table, item_codes, num_semantic_tokens = build_semantic_table(
         semantic_obj, num_items
     )
-    preprocess_start = time.perf_counter()
-    (
-        soft_ids,
-        candidate_prior,
-        local_consistency,
-        hard_consistency,
-        correction_features,
-    ) = build_soft_sid_table(
-        hard_table,
-        item_codes,
-        SoftSIDConfig(
-            top_m=args.soft_top_m,
-            loo_min_overlap_slots=args.loo_min_overlap_slots,
-            min_support=args.soft_min_support,
-            min_conditional_lift=args.soft_min_conditional_lift,
-            max_neighbors=args.soft_max_neighbors,
-            tie_break_seed=args.seed,
-        ),
-    )
-    write_json(
-        output_dir / "soft_sid_preprocess.json",
-        {
-            "elapsed_seconds": time.perf_counter() - preprocess_start,
-            "local_consistency_mean": float(local_consistency[1:].mean()),
-            "local_consistency_min": float(local_consistency[1:].min()),
-            "local_consistency_max": float(local_consistency[1:].max()),
-            "hard_consistency_mean": float(hard_consistency[1:].mean()),
-            "hard_consistency_min": float(hard_consistency[1:].min()),
-            "hard_consistency_max": float(hard_consistency[1:].max()),
-            "mismatch_score_mean": float(
-                (local_consistency[1:] - hard_consistency[1:]).mean()
+    if args.model_variant == "locorec":
+        preprocess_start = time.perf_counter()
+        (
+            soft_ids,
+            candidate_prior,
+            local_consistency,
+            hard_consistency,
+            correction_features,
+        ) = build_soft_sid_table(
+            hard_table,
+            item_codes,
+            SoftSIDConfig(
+                top_m=args.soft_top_m,
+                loo_min_overlap_slots=args.loo_min_overlap_slots,
+                min_support=args.soft_min_support,
+                min_conditional_lift=args.soft_min_conditional_lift,
+                max_neighbors=args.soft_max_neighbors,
+                tie_break_seed=args.seed,
             ),
-            "candidate_slots_with_alternatives": int(
-                soft_ids[1:, :, 1:].ne(0).any(dim=-1).sum()
-            ),
-            "correction_feature_mean": correction_features[1:].mean(
-                dim=(0, 1)
-            ).tolist(),
-        },
-    )
+        )
+        write_json(
+            output_dir / "soft_sid_preprocess.json",
+            {
+                "elapsed_seconds": time.perf_counter() - preprocess_start,
+                "local_consistency_mean": float(local_consistency[1:].mean()),
+                "local_consistency_min": float(local_consistency[1:].min()),
+                "local_consistency_max": float(local_consistency[1:].max()),
+                "hard_consistency_mean": float(hard_consistency[1:].mean()),
+                "hard_consistency_min": float(hard_consistency[1:].min()),
+                "hard_consistency_max": float(hard_consistency[1:].max()),
+                "mismatch_score_mean": float(
+                    (local_consistency[1:] - hard_consistency[1:]).mean()
+                ),
+                "candidate_slots_with_alternatives": int(
+                    soft_ids[1:, :, 1:].ne(0).any(dim=-1).sum()
+                ),
+                "correction_feature_mean": correction_features[1:].mean(
+                    dim=(0, 1)
+                ).tolist(),
+            },
+        )
+    else:
+        write_json(
+            output_dir / "hard_sid_preprocess.json",
+            {
+                "model_variant": "hard_sid_fusion",
+                "fusion": "LayerNorm(W_s mean_l E_s(z_i^l) + E_id(i))",
+                "uses_soft_candidates": False,
+                "uses_loo_neighbors": False,
+                "uses_shared_residual": False,
+                "uses_hierarchical_gate": False,
+            },
+        )
     item_frequency = build_train_item_frequency(sequences, num_items)
 
     train_dataset = NextItemDataset(sequences, args.max_len, "train")
@@ -168,41 +181,57 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device(
         args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     )
-    model = LoCoRec(
-        num_items=num_items,
-        num_semantic_tokens=num_semantic_tokens,
-        soft_sid_table=soft_ids,
-        candidate_prior=candidate_prior,
-        correction_features=correction_features,
-        local_consistency=local_consistency,
-        item_frequency=item_frequency,
-        dim=args.dim,
-        max_len=args.max_len,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        tail_tau=args.tail_tau,
-        residual_scale=args.residual_scale,
-        gate_correction_scale=args.gate_correction_scale,
-        gate_private_margin=args.gate_private_margin,
-    ).to(device)
-
-    gate_parameters = [
-        *model.item_encoder.residual_gate.parameters(),
-        *model.item_encoder.soft_correction_gate.parameters(),
-    ]
-    gate_ids = {id(parameter) for parameter in gate_parameters}
-    base_parameters = [
-        parameter for parameter in model.parameters() if id(parameter) not in gate_ids
-    ]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": base_parameters, "lr": args.lr},
-            {"params": gate_parameters, "lr": args.lr * args.gate_lr_scale},
-        ],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    if args.model_variant == "hard_sid_fusion":
+        model = HardSIDFusion(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            hard_sid_table=hard_table,
+            dim=args.dim,
+            max_len=args.max_len,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+        ).to(device)
+        gate_parameters = []
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+    else:
+        model = LoCoRec(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            soft_sid_table=soft_ids,
+            candidate_prior=candidate_prior,
+            correction_features=correction_features,
+            local_consistency=local_consistency,
+            item_frequency=item_frequency,
+            dim=args.dim,
+            max_len=args.max_len,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            tail_tau=args.tail_tau,
+            residual_scale=args.residual_scale,
+            gate_correction_scale=args.gate_correction_scale,
+            gate_private_margin=args.gate_private_margin,
+        ).to(device)
+        gate_parameters = [
+            *model.item_encoder.residual_gate.parameters(),
+            *model.item_encoder.soft_correction_gate.parameters(),
+        ]
+        gate_ids = {id(parameter) for parameter in gate_parameters}
+        base_parameters = [
+            parameter for parameter in model.parameters()
+            if id(parameter) not in gate_ids
+        ]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": base_parameters, "lr": args.lr},
+                {"params": gate_parameters, "lr": args.lr * args.gate_lr_scale},
+            ],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
 
     best_valid = -1.0
     best_path = output_dir / "best.pt"
@@ -210,7 +239,10 @@ def train(args: argparse.Namespace) -> None:
     stale_epochs = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
-        gate_trainable = epoch > args.gate_warmup_epochs
+        gate_trainable = (
+            args.model_variant == "hard_sid_fusion"
+            or epoch > args.gate_warmup_epochs
+        )
         for parameter in gate_parameters:
             parameter.requires_grad_(gate_trainable)
 
@@ -290,10 +322,17 @@ def train(args: argparse.Namespace) -> None:
     result = {
         "test": test_metrics,
         "best_valid_NDCG@10": best_valid,
-        "learned_prior_beta": float(
-            torch.nn.functional.softplus(model.item_encoder.prior_beta_raw).detach().cpu()
+        "learned_prior_beta": (
+            float(
+                torch.nn.functional.softplus(
+                    model.item_encoder.prior_beta_raw
+                ).detach().cpu()
+            )
+            if args.model_variant == "locorec"
+            else None
         ),
         "learned_gate_statistics": model.item_encoder.statistics(),
+        "item_encoder_statistics": model.item_encoder.statistics(),
         "args": vars(args),
     }
     write_json(output_dir / "history.json", history)
@@ -306,6 +345,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--semantic-ids", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--model-variant",
+        choices=("locorec", "hard_sid_fusion"),
+        default="locorec",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--early-stop-patience", type=int, default=10)

@@ -15,7 +15,7 @@ python LoCoRecLOOCorrection/train.py \
   --dim 128 \
   --num-heads 2 \
   --num-layers 2 \
-  --dropout 0.2 \
+  --dropout 0.4 \
   --lr 0.001 \
   --weight-decay 0.0001 \
   --grad-clip 5.0 \

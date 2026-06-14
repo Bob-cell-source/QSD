@@ -88,6 +88,115 @@ class CausalTransformerEncoder(nn.Module):
         return self.output_norm(hidden)[:, -1]
 
 
+class HardSIDFusionItemEncoder(nn.Module):
+    """Directly fuse deterministic SID semantics with an Item-ID embedding."""
+
+    def __init__(
+        self,
+        num_items: int,
+        num_semantic_tokens: int,
+        hard_sid_table: torch.Tensor,
+        dim: int = 128,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("hard_sid_table", hard_sid_table.long())
+        self.semantic_embedding = nn.Embedding(
+            num_semantic_tokens + 1, dim, padding_idx=0
+        )
+        self.item_embedding = nn.Embedding(num_items + 1, dim, padding_idx=0)
+        self.semantic_projection = nn.Linear(dim, dim)
+        self.output_norm = nn.LayerNorm(dim, eps=1e-8)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        for parameter in self.parameters():
+            if parameter.dim() > 1:
+                nn.init.xavier_normal_(parameter)
+        with torch.no_grad():
+            self.semantic_embedding.weight[0].zero_()
+            self.item_embedding.weight[0].zero_()
+
+    def forward(self, items: torch.Tensor) -> Dict[str, torch.Tensor]:
+        tokens = self.hard_sid_table[items]
+        mask = tokens.ne(0).unsqueeze(-1).float()
+        semantic = (self.semantic_embedding(tokens) * mask).sum(dim=-2)
+        semantic = semantic / mask.sum(dim=-2).clamp_min(1.0)
+        semantic = self.semantic_projection(semantic)
+        collaborative = self.item_embedding(items)
+        vectors = self.output_norm(semantic + collaborative)
+        # CausalTransformerEncoder already applies input dropout. Applying the
+        # same rate here would drop the fused item representation twice.
+        vectors = vectors * items.ne(0).unsqueeze(-1)
+        zero = vectors.new_zeros(())
+        return {
+            "vectors": vectors,
+            "attention_entropy": zero,
+            "gate_kl": zero,
+            "private_penalty": zero,
+            "gate_mean": vectors.new_zeros(3),
+            "soft_correction_mean": zero,
+        }
+
+    def statistics(self) -> Dict[str, float]:
+        return {
+            "semantic_weight": 1.0,
+            "collaborative_weight": 1.0,
+        }
+
+
+class HardSIDFusion(nn.Module):
+    def __init__(
+        self,
+        num_items: int,
+        num_semantic_tokens: int,
+        hard_sid_table: torch.Tensor,
+        dim: int = 128,
+        max_len: int = 50,
+        num_heads: int = 2,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.sequence_encoder = CausalTransformerEncoder(
+            dim=dim,
+            max_len=max_len,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.item_encoder = HardSIDFusionItemEncoder(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            hard_sid_table=hard_sid_table,
+            dim=dim,
+            dropout=dropout,
+        )
+
+    def encode_sequence(self, sequence: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        output = self.item_encoder(sequence)
+        return self.sequence_encoder(sequence, output["vectors"]), output
+
+    def score_candidates(
+        self, user_vector: torch.Tensor, candidates: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        output = self.item_encoder(candidates)
+        scores = torch.einsum("bd,bcd->bc", user_vector, output["vectors"])
+        return scores, output
+
+    def forward(self, sequence: torch.Tensor, candidates: torch.Tensor) -> Dict[str, torch.Tensor]:
+        user_vector, sequence_output = self.encode_sequence(sequence)
+        scores, candidate_output = self.score_candidates(user_vector, candidates)
+        return {
+            "score": scores,
+            "attention_entropy": sequence_output["attention_entropy"],
+            "gate_kl": sequence_output["gate_kl"],
+            "private_penalty": sequence_output["private_penalty"],
+            "gate_mean": sequence_output["gate_mean"],
+            "soft_correction_mean": candidate_output["soft_correction_mean"],
+        }
+
+
 class LoCoRecItemEncoder(nn.Module):
     def __init__(
         self,

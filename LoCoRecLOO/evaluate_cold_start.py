@@ -4,7 +4,7 @@ import csv
 import json
 import math
 import sys
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
 
 import torch
@@ -64,6 +64,47 @@ def build_popular_sid_flags(item_codes, quantile):
     return flags, metadata
 
 
+def build_high_sharing_flags(item_codes, min_overlap, max_neighbors, quantile):
+    depth = len(next(iter(item_codes.values()))) if item_codes else 0
+    inverted = defaultdict(list)
+    for item, codes in item_codes.items():
+        for level, code in enumerate(codes):
+            inverted[(level, int(code))].append(item)
+    scores = {}
+    for item, codes in item_codes.items():
+        level_counts = []
+        for held_out in range(depth):
+            overlap = Counter()
+            for level, code in enumerate(codes):
+                if level != held_out:
+                    overlap.update(inverted[(level, int(code))])
+            count = sum(
+                1
+                for neighbor, matches in overlap.items()
+                if neighbor != item and matches >= min_overlap
+            )
+            level_counts.append(min(count, max_neighbors))
+        scores[item] = sum(math.log1p(value) for value in level_counts) / max(depth, 1)
+    values = sorted(scores.values())
+    if values:
+        index = min(
+            len(values) - 1,
+            max(0, int(math.ceil(quantile * len(values))) - 1),
+        )
+        threshold = values[index]
+    else:
+        threshold = float("inf")
+    flags = {item: score >= threshold for item, score in scores.items()}
+    metadata = {
+        "quantile": quantile,
+        "threshold": threshold,
+        "num_flagged_items": sum(flags.values()),
+        "num_items": len(flags),
+        "definition": "top-quantile mean log(1 + LOO neighbor count) across quantization levels",
+    }
+    return flags, metadata
+
+
 def parse_buckets(spec):
     buckets = []
     for raw in spec.split(","):
@@ -108,7 +149,7 @@ def finalize(stats):
     }
 
 
-def build_model(checkpoint, device, popular_sid_quantile):
+def build_model(checkpoint, device, popular_sid_quantile, high_sharing_quantile):
     state = torch.load(checkpoint, map_location="cpu")
     cfg = dict(state["args"])
     dataset_dir = Path(cfg["dataset_dir"])
@@ -154,6 +195,12 @@ def build_model(checkpoint, device, popular_sid_quantile):
     popular_flags, popular_metadata = build_popular_sid_flags(
         item_codes, popular_sid_quantile
     )
+    high_sharing_flags, high_sharing_metadata = build_high_sharing_flags(
+        item_codes,
+        int(cfg.get("loo_min_overlap_slots", 2)),
+        int(cfg.get("soft_max_neighbors", 50)),
+        high_sharing_quantile,
+    )
     return (
         model.to(device).eval(),
         sequences,
@@ -162,11 +209,22 @@ def build_model(checkpoint, device, popular_sid_quantile):
         cfg,
         popular_flags,
         popular_metadata,
+        high_sharing_flags,
+        high_sharing_metadata,
     )
 
 
 @torch.no_grad()
-def evaluate(model, sequences, frequency, num_items, cfg, popular_flags, args):
+def evaluate(
+    model,
+    sequences,
+    frequency,
+    num_items,
+    cfg,
+    popular_flags,
+    high_sharing_flags,
+    args,
+):
     dataset = NextItemDataset(sequences, int(cfg.get("max_len", 50)), "test")
     loader = DataLoader(
         dataset,
@@ -182,6 +240,8 @@ def evaluate(model, sequences, frequency, num_items, cfg, popular_flags, args):
         f"warm_gt{args.cold_threshold}",
         "popular_sid",
         "non_popular_sid",
+        "high_sharing",
+        "non_high_sharing",
         *(name for name, _, _ in buckets),
         "other",
     ]
@@ -222,6 +282,10 @@ def evaluate(model, sequences, frequency, num_items, cfg, popular_flags, args):
                 add_rank(grouped["popular_sid"], rank)
             else:
                 add_rank(grouped["non_popular_sid"], rank)
+            if high_sharing_flags.get(target, False):
+                add_rank(grouped["high_sharing"], rank)
+            else:
+                add_rank(grouped["non_high_sharing"], rank)
             add_rank(grouped[group], rank)
     return OrderedDict(
         (name, finalize(stats))
@@ -248,6 +312,7 @@ def main():
     parser.add_argument("--cold-threshold", type=int, default=5)
     parser.add_argument("--buckets", default="0,1-2,3-5,6-10,>10")
     parser.add_argument("--popular-sid-quantile", type=float, default=0.90)
+    parser.add_argument("--high-sharing-quantile", type=float, default=0.90)
     args = parser.parse_args()
     args.device = torch.device(
         args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
@@ -261,11 +326,23 @@ def main():
         cfg,
         popular_flags,
         popular_metadata,
+        high_sharing_flags,
+        high_sharing_metadata,
     ) = build_model(
-        args.checkpoint, args.device, args.popular_sid_quantile
+        args.checkpoint,
+        args.device,
+        args.popular_sid_quantile,
+        args.high_sharing_quantile,
     )
     groups = evaluate(
-        model, sequences, frequency, num_items, cfg, popular_flags, args
+        model,
+        sequences,
+        frequency,
+        num_items,
+        cfg,
+        popular_flags,
+        high_sharing_flags,
+        args,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -274,6 +351,7 @@ def main():
         "cold_threshold": args.cold_threshold,
         "buckets": args.buckets,
         "popular_sid": popular_metadata,
+        "high_sharing": high_sharing_metadata,
         "groups": groups,
     }
     write_json(args.output_dir / "cold_start_metrics.json", payload)

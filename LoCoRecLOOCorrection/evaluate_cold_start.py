@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from locorec.data import NextItemDataset, collate_eval
 from locorec.io import read_json, write_json
-from locorec.model import LoCoRec
+from locorec.model import HardSIDFusion, LoCoRec
 from locorec.soft_sid import (
     SoftSIDConfig,
     build_semantic_table,
@@ -64,6 +64,32 @@ def build_popular_sid_flags(item_codes, quantile):
     return flags, metadata
 
 
+def build_high_sharing_flags(correction_features, quantile):
+    # Feature 0 is log(1 + LOO neighbor count) at each quantization level.
+    scores = correction_features[1:, :, 0].mean(dim=1)
+    values = torch.sort(scores).values
+    if values.numel():
+        index = min(
+            values.numel() - 1,
+            max(0, int(math.ceil(quantile * values.numel())) - 1),
+        )
+        threshold = float(values[index].item())
+    else:
+        threshold = float("inf")
+    flags = {
+        item: float(scores[item - 1].item()) >= threshold
+        for item in range(1, scores.numel() + 1)
+    }
+    metadata = {
+        "quantile": quantile,
+        "threshold": threshold,
+        "num_flagged_items": sum(flags.values()),
+        "num_items": scores.numel(),
+        "definition": "top-quantile mean log(1 + LOO neighbor count) across quantization levels",
+    }
+    return flags, metadata
+
+
 def parse_buckets(spec):
     buckets = []
     for raw in spec.split(","):
@@ -108,7 +134,7 @@ def finalize(stats):
     }
 
 
-def build_model(checkpoint, device, popular_sid_quantile):
+def build_model(checkpoint, device, popular_sid_quantile, high_sharing_quantile):
     state = torch.load(checkpoint, map_location="cpu")
     cfg = dict(state["args"])
     dataset_dir = Path(cfg["dataset_dir"])
@@ -142,27 +168,42 @@ def build_model(checkpoint, device, popular_sid_quantile):
         ),
     )
     frequency = build_train_item_frequency(sequences, num_items)
-    model = LoCoRec(
-        num_items=num_items,
-        num_semantic_tokens=num_semantic_tokens,
-        soft_sid_table=soft_ids,
-        candidate_prior=candidate_prior,
-        correction_features=correction_features,
-        local_consistency=local_consistency,
-        item_frequency=frequency,
-        dim=int(cfg.get("dim", 128)),
-        max_len=int(cfg.get("max_len", 50)),
-        num_heads=int(cfg.get("num_heads", 2)),
-        num_layers=int(cfg.get("num_layers", 2)),
-        dropout=float(cfg.get("dropout", 0.2)),
-        tail_tau=float(cfg.get("tail_tau", 20.0)),
-        residual_scale=float(cfg.get("residual_scale", 1.0)),
-        gate_correction_scale=float(cfg.get("gate_correction_scale", 0.3)),
-        gate_private_margin=float(cfg.get("gate_private_margin", 0.05)),
-    )
+    if cfg.get("model_variant", "locorec") == "hard_sid_fusion":
+        model = HardSIDFusion(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            hard_sid_table=hard_table,
+            dim=int(cfg.get("dim", 128)),
+            max_len=int(cfg.get("max_len", 50)),
+            num_heads=int(cfg.get("num_heads", 2)),
+            num_layers=int(cfg.get("num_layers", 2)),
+            dropout=float(cfg.get("dropout", 0.2)),
+        )
+    else:
+        model = LoCoRec(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            soft_sid_table=soft_ids,
+            candidate_prior=candidate_prior,
+            correction_features=correction_features,
+            local_consistency=local_consistency,
+            item_frequency=frequency,
+            dim=int(cfg.get("dim", 128)),
+            max_len=int(cfg.get("max_len", 50)),
+            num_heads=int(cfg.get("num_heads", 2)),
+            num_layers=int(cfg.get("num_layers", 2)),
+            dropout=float(cfg.get("dropout", 0.2)),
+            tail_tau=float(cfg.get("tail_tau", 20.0)),
+            residual_scale=float(cfg.get("residual_scale", 1.0)),
+            gate_correction_scale=float(cfg.get("gate_correction_scale", 0.3)),
+            gate_private_margin=float(cfg.get("gate_private_margin", 0.05)),
+        )
     model.load_state_dict(state["model"], strict=True)
     popular_flags, popular_metadata = build_popular_sid_flags(
         item_codes, popular_sid_quantile
+    )
+    high_sharing_flags, high_sharing_metadata = build_high_sharing_flags(
+        correction_features, high_sharing_quantile
     )
     return (
         model.to(device).eval(),
@@ -172,11 +213,22 @@ def build_model(checkpoint, device, popular_sid_quantile):
         cfg,
         popular_flags,
         popular_metadata,
+        high_sharing_flags,
+        high_sharing_metadata,
     )
 
 
 @torch.no_grad()
-def evaluate(model, sequences, frequency, num_items, cfg, popular_flags, args):
+def evaluate(
+    model,
+    sequences,
+    frequency,
+    num_items,
+    cfg,
+    popular_flags,
+    high_sharing_flags,
+    args,
+):
     dataset = NextItemDataset(sequences, int(cfg.get("max_len", 50)), "test")
     loader = DataLoader(
         dataset,
@@ -192,6 +244,8 @@ def evaluate(model, sequences, frequency, num_items, cfg, popular_flags, args):
         f"warm_gt{args.cold_threshold}",
         "popular_sid",
         "non_popular_sid",
+        "high_sharing",
+        "non_high_sharing",
         *(name for name, _, _ in buckets),
         "other",
     ]
@@ -232,6 +286,10 @@ def evaluate(model, sequences, frequency, num_items, cfg, popular_flags, args):
                 add_rank(grouped["popular_sid"], rank)
             else:
                 add_rank(grouped["non_popular_sid"], rank)
+            if high_sharing_flags.get(target, False):
+                add_rank(grouped["high_sharing"], rank)
+            else:
+                add_rank(grouped["non_high_sharing"], rank)
             add_rank(grouped[group], rank)
     return OrderedDict(
         (name, finalize(stats))
@@ -258,6 +316,7 @@ def main():
     parser.add_argument("--cold-threshold", type=int, default=5)
     parser.add_argument("--buckets", default="0,1-2,3-5,6-10,>10")
     parser.add_argument("--popular-sid-quantile", type=float, default=0.90)
+    parser.add_argument("--high-sharing-quantile", type=float, default=0.90)
     args = parser.parse_args()
     args.device = torch.device(
         args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
@@ -271,11 +330,23 @@ def main():
         cfg,
         popular_flags,
         popular_metadata,
+        high_sharing_flags,
+        high_sharing_metadata,
     ) = build_model(
-        args.checkpoint, args.device, args.popular_sid_quantile
+        args.checkpoint,
+        args.device,
+        args.popular_sid_quantile,
+        args.high_sharing_quantile,
     )
     groups = evaluate(
-        model, sequences, frequency, num_items, cfg, popular_flags, args
+        model,
+        sequences,
+        frequency,
+        num_items,
+        cfg,
+        popular_flags,
+        high_sharing_flags,
+        args,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -284,6 +355,7 @@ def main():
         "cold_threshold": args.cold_threshold,
         "buckets": args.buckets,
         "popular_sid": popular_metadata,
+        "high_sharing": high_sharing_metadata,
         "groups": groups,
     }
     write_json(args.output_dir / "cold_start_metrics.json", payload)
