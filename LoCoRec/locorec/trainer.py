@@ -108,6 +108,7 @@ def train(args: argparse.Namespace) -> None:
             consistency_floor=args.soft_consistency_floor,
             max_neighbors=args.soft_max_neighbors,
             tie_break_seed=args.seed,
+            leave_one_level_out=args.soft_leave_one_level_out,
         ),
     )
     write_json(
@@ -117,6 +118,11 @@ def train(args: argparse.Namespace) -> None:
             "local_consistency_mean": float(local_consistency[1:].mean()),
             "local_consistency_min": float(local_consistency[1:].min()),
             "local_consistency_max": float(local_consistency[1:].max()),
+            "reliability_mode": (
+                "leave_one_quantization_level_out"
+                if args.soft_leave_one_level_out
+                else "legacy_same_neighborhood"
+            ),
         },
     )
     item_frequency = build_train_item_frequency(sequences, num_items)
@@ -300,6 +306,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--soft-min-support", type=float, default=0.05)
     parser.add_argument("--soft-consistency-floor", type=float, default=0.10)
     parser.add_argument("--soft-max-neighbors", type=int, default=50)
+    parser.add_argument(
+        "--soft-leave-one-level-out",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--tail-tau", type=float, default=20.0)
     parser.add_argument("--residual-scale", type=float, default=1.0)
     parser.add_argument("--gate-correction-scale", type=float, default=0.3)

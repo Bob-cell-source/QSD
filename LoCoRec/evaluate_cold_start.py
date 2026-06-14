@@ -93,6 +93,11 @@ def build_model(checkpoint, device):
             consistency_floor=float(cfg.get("soft_consistency_floor", 0.1)),
             max_neighbors=int(cfg.get("soft_max_neighbors", 50)),
             tie_break_seed=int(cfg.get("seed", 2026)),
+            # Checkpoints created before the LOO fix retain their original
+            # preprocessing semantics instead of silently changing at load.
+            leave_one_level_out=bool(
+                cfg.get("soft_leave_one_level_out", False)
+            ),
         ),
     )
     frequency = build_train_item_frequency(sequences, num_items)

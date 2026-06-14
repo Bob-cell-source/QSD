@@ -13,6 +13,7 @@ class SoftSIDConfig:
     consistency_floor: float = 0.10
     max_neighbors: int = 50
     tie_break_seed: int = 2026
+    leave_one_level_out: bool = True
 
 
 def _stable_tie_break(item: int, neighbor: int, seed: int) -> int:
@@ -72,26 +73,34 @@ def build_soft_sid_table(
     local_consistency = torch.zeros(num_items + 1, dtype=torch.float)
 
     for item in range(1, num_items + 1):
-        overlap_counts: Counter[int] = Counter()
-        for slot, code in enumerate(item_codes[item]):
-            overlap_counts.update(inverted[(slot, code)])
-        neighbors = [
-            (neighbor, overlap)
-            for neighbor, overlap in overlap_counts.items()
-            if neighbor != item and overlap >= config.min_overlap_slots
-        ]
-        neighbors.sort(
-            key=lambda row: (
-                row[1],
-                _stable_tie_break(item, row[0], config.tie_break_seed),
-            ),
-            reverse=True,
-        )
-        neighbor_ids = [neighbor for neighbor, _ in neighbors[: config.max_neighbors]]
-        denominator = max(len(neighbor_ids), 1)
-
         item_consistency = 0.0
+        valid_consistency_levels = 0
         for slot in range(depth):
+            overlap_counts: Counter[int] = Counter()
+            for context_slot, code in enumerate(item_codes[item]):
+                if config.leave_one_level_out and context_slot == slot:
+                    continue
+                overlap_counts.update(inverted[(context_slot, code)])
+            neighbors = [
+                (neighbor, overlap)
+                for neighbor, overlap in overlap_counts.items()
+                if neighbor != item and overlap >= config.min_overlap_slots
+            ]
+            neighbors.sort(
+                key=lambda row: (
+                    row[1],
+                    _stable_tie_break(
+                        item,
+                        row[0],
+                        config.tie_break_seed + slot * 0x9E3779B1,
+                    ),
+                ),
+                reverse=True,
+            )
+            neighbor_ids = [
+                neighbor for neighbor, _ in neighbors[: config.max_neighbors]
+            ]
+            denominator = max(len(neighbor_ids), 1)
             hard_token = int(semantic_table[item, slot])
             counts = Counter(
                 int(semantic_table[neighbor, slot]) for neighbor in neighbor_ids
@@ -115,11 +124,22 @@ def build_soft_sid_table(
             for rank, ((token, _), weight) in enumerate(zip(ranked, weights.tolist())):
                 soft_ids[item, slot, rank] = token
                 priors[item, slot, rank] = weight
-                item_consistency += weight * counts.get(token, 0) / denominator
+
+            if neighbor_ids:
+                if config.leave_one_level_out:
+                    # Reliability is the held-out conditional concentration.
+                    # It is independent of the hard anchor and candidate prior.
+                    item_consistency += max(counts.values()) / len(neighbor_ids)
+                else:
+                    item_consistency += sum(
+                        weight * counts.get(token, 0) / denominator
+                        for (token, _), weight in zip(ranked, weights.tolist())
+                    )
+                valid_consistency_levels += 1
 
         local_consistency[item] = max(
             config.consistency_floor,
-            item_consistency / max(depth, 1),
+            item_consistency / max(valid_consistency_levels, 1),
         )
     return soft_ids, priors, local_consistency.clamp(0.0, 1.0)
 
