@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Some server launchers export an empty or non-integer OpenMP setting.
+if [[ ! "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  export OMP_NUM_THREADS=1
+fi
+
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATASET_DIR="${DATASET_DIR:-runs/office}"
 ABLATION_ROOT="${ABLATION_ROOT:-${DATASET_DIR}/lc_soft_required_ablation}"
@@ -11,6 +16,27 @@ BATCH_SIZE="${BATCH_SIZE:-128}"
 CANDIDATE_CHUNK_SIZE="${CANDIDATE_CHUNK_SIZE:-512}"
 
 mkdir -p "${OUTPUT_DIR}/base_models" "${OUTPUT_DIR}/locorec"
+
+LOCOREC_EVALUATOR="$("${PYTHON_BIN}" - "${LOCOREC_CHECKPOINT}" <<'PY'
+import sys
+from pathlib import Path
+import torch
+
+checkpoint = Path(sys.argv[1])
+state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+keys = state.get("model", {}).keys()
+if any(key.startswith("item_encoder.soft_correction_gate.") for key in keys):
+    print("LoCoRecLOOCorrection/evaluate_cold_start.py")
+else:
+    print("LoCoRec/evaluate_cold_start.py")
+PY
+)"
+
+if [[ ! -f "${LOCOREC_EVALUATOR}" ]]; then
+  echo "Missing evaluator required by checkpoint: ${LOCOREC_EVALUATOR}" >&2
+  exit 1
+fi
+echo "LoCoRec evaluator: ${LOCOREC_EVALUATOR}"
 
 "${PYTHON_BIN}" LCSoftCRSID/scripts/evaluate_cold_start.py \
   --checkpoint "sasrec_id_only=${ABLATION_ROOT}/00_sasrec_id_only/best.pt" \
@@ -23,7 +49,7 @@ mkdir -p "${OUTPUT_DIR}/base_models" "${OUTPUT_DIR}/locorec"
   --candidate-chunk-size "${CANDIDATE_CHUNK_SIZE}" \
   --cold-threshold 5
 
-"${PYTHON_BIN}" LoCoRec/evaluate_cold_start.py \
+"${PYTHON_BIN}" "${LOCOREC_EVALUATOR}" \
   --checkpoint "${LOCOREC_CHECKPOINT}" \
   --output-dir "${OUTPUT_DIR}/locorec" \
   --device "${DEVICE}" \

@@ -131,12 +131,15 @@ def inspect_text_lengths(
 ) -> None:
     try:
         import numpy as np
-        from sentence_transformers import SentenceTransformer
     except ImportError as exc:
-        raise RuntimeError("Length inspection requires numpy and sentence-transformers.") from exc
+        raise RuntimeError("Length inspection requires numpy.") from exc
 
-    model = SentenceTransformer(encoder_model, device=device)
-    tokenizer = model.tokenizer
+    try:
+        from sentence_transformers import SentenceTransformer
+        tokenizer = SentenceTransformer(encoder_model, device=device).tokenizer
+    except (ImportError, OSError, ValueError):
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(encoder_model)
 
     lengths = []
     for text in texts:
@@ -145,7 +148,6 @@ def inspect_text_lengths(
             truncation=False,
             add_special_tokens=True,
             return_attention_mask=False,
-            return_token_type_ids=False,
         )["input_ids"]
         lengths.append(len(token_ids))
 
@@ -343,6 +345,68 @@ def build_semantic_ids_with_encoder(
     )
 
 
+def build_semantic_ids_with_tfidf(
+    item_meta_path: str | Path,
+    output_path: str | Path,
+    codebook_sizes: Sequence[int],
+    max_desc_words: int = 160,
+    max_features: int = 50000,
+    svd_dim: int = 256,
+    seed: int = 2026,
+    save_embeddings: str | Path | None = None,
+    save_item_ids: str | Path | None = None,
+) -> None:
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.preprocessing import normalize
+
+    item_ids, texts = load_item_texts(item_meta_path, max_desc_words=max_desc_words)
+    vectorizer = TfidfVectorizer(
+        max_features=max_features,
+        ngram_range=(1, 2),
+        min_df=2,
+        strip_accents="unicode",
+        lowercase=True,
+    )
+    tfidf = vectorizer.fit_transform(texts)
+    dim = min(int(svd_dim), max(1, min(tfidf.shape) - 1))
+    svd = TruncatedSVD(n_components=dim, random_state=seed)
+    embeddings = normalize(svd.fit_transform(tfidf)).astype("float32")
+
+    if save_embeddings is not None:
+        import numpy as np
+
+        Path(save_embeddings).parent.mkdir(parents=True, exist_ok=True)
+        np.save(save_embeddings, embeddings)
+    if save_item_ids is not None:
+        write_json(save_item_ids, list(item_ids))
+
+    semantic_ids = build_rq_kmeans_from_embeddings(
+        embeddings=embeddings,
+        item_ids=item_ids,
+        codebook_sizes=codebook_sizes,
+        seed=seed,
+    )
+    write_json(
+        output_path,
+        {
+            "method": "tfidf_svd_rq_kmeans",
+            "codebook_sizes": list(map(int, codebook_sizes)),
+            "max_features": int(max_features),
+            "svd_dim": int(dim),
+            "semantic_ids": semantic_ids,
+        },
+    )
+    print(
+        {
+            "num_items": len(item_ids),
+            "embedding_dim": int(embeddings.shape[1]),
+            "codebook_sizes": list(map(int, codebook_sizes)),
+            "method": "tfidf_svd_rq_kmeans",
+        }
+    )
+
+
 def parse_codebook_sizes(value: str) -> List[int]:
     return [int(x) for x in value.split(",") if x.strip()]
 
@@ -370,6 +434,17 @@ def main() -> None:
     p_rq.add_argument("--output", required=True)
     p_rq.add_argument("--codebook-sizes", default="64,128,256,512")
     p_rq.add_argument("--seed", type=int, default=2026)
+
+    p_tfidf = sub.add_parser("tfidf")
+    p_tfidf.add_argument("--item-meta", required=True)
+    p_tfidf.add_argument("--output", required=True)
+    p_tfidf.add_argument("--codebook-sizes", default="64,128,256,512")
+    p_tfidf.add_argument("--max-desc-words", type=int, default=160)
+    p_tfidf.add_argument("--max-features", type=int, default=50000)
+    p_tfidf.add_argument("--svd-dim", type=int, default=256)
+    p_tfidf.add_argument("--seed", type=int, default=2026)
+    p_tfidf.add_argument("--save-embeddings", default=None)
+    p_tfidf.add_argument("--save-item-ids", default=None)
 
     p_analyze = sub.add_parser("analyze")
     p_analyze.add_argument("--semantic-ids", required=True)
@@ -411,6 +486,18 @@ def main() -> None:
                 "codebook_sizes": parse_codebook_sizes(args.codebook_sizes),
                 "semantic_ids": semantic_ids,
             },
+        )
+    elif args.cmd == "tfidf":
+        build_semantic_ids_with_tfidf(
+            item_meta_path=args.item_meta,
+            output_path=args.output,
+            codebook_sizes=parse_codebook_sizes(args.codebook_sizes),
+            max_desc_words=args.max_desc_words,
+            max_features=args.max_features,
+            svd_dim=args.svd_dim,
+            seed=args.seed,
+            save_embeddings=args.save_embeddings,
+            save_item_ids=args.save_item_ids,
         )
     elif args.cmd == "analyze":
         analyze_semantic_ids(args.semantic_ids, args.output, args.top_groups)

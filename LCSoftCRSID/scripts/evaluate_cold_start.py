@@ -27,6 +27,14 @@ from lcsoftcrsid.soft_sid import (
     build_train_item_frequency,
 )
 from qsdrec.model import SASRecEncoder
+from qsdrec.model import CRSIDRec as LegacyCRSIDRec
+from LoCoRecLOOCorrection.locorec.model import HardSIDFusion
+from qsdrec.train import (
+    build_behavior_neighbors as build_legacy_behavior_neighbors,
+    build_semantic_hubness as build_legacy_semantic_hubness,
+    build_soft_semantic_table as build_legacy_soft_semantic_table,
+    build_text_knn_neighbors as build_legacy_text_knn_neighbors,
+)
 
 
 DEFAULT_BUCKETS = "0,1-2,3-5,6-10,>10"
@@ -109,7 +117,7 @@ def build_model(
     state: dict[str, Any],
     device: torch.device,
 ) -> tuple[
-    LCSoftCRSID | SASRecEncoder,
+    LCSoftCRSID | SASRecEncoder | LegacyCRSIDRec | HardSIDFusion,
     list[dict[str, Any]],
     torch.Tensor,
     int,
@@ -149,6 +157,133 @@ def build_model(
         cfg["dataset_dir"] = str(dataset_dir)
         cfg["semantic_ids"] = str(semantic_ids)
         cfg["evaluation_family"] = "sasrec_id_only"
+        return model, sequences, frequency, num_items, cfg
+
+    # Checkpoints produced by scripts/run_lc_soft_required_ablations.sh use
+    # the original qsdrec.model.CRSIDRec layout rather than LCSoftCRSID.
+    if "semantic_basis_emb.weight" in state["model"]:
+        semantic_obj = read_json(semantic_ids)
+        hard_table, item_codes, num_semantic_tokens = build_semantic_table(
+            semantic_obj, num_items
+        )
+        semantic_hubness, _ = build_legacy_semantic_hubness(
+            hard_table, num_semantic_tokens
+        )
+        variant = str(cfg.get("model_variant", "crsid"))
+        soft_table = soft_weights = reliability = None
+        if variant == "crsid_soft":
+            base_neighbors = None
+            if str(cfg.get("cr_soft_neighbor_source", "sid_overlap")) == "text_knn":
+                base_neighbors, _ = build_legacy_text_knn_neighbors(
+                    embeddings_path=resolve_path(
+                        cfg["cr_soft_text_embeddings"], checkpoint_path
+                    ),
+                    item_ids_path=resolve_path(
+                        cfg["cr_soft_text_item_ids"], checkpoint_path
+                    ),
+                    num_items=num_items,
+                    max_neighbors=int(cfg.get("cr_soft_max_neighbors", 50)),
+                    chunk_size=int(cfg.get("cr_soft_text_knn_chunk_size", 256)),
+                )
+            behavior_neighbors = None
+            if float(cfg.get("cr_soft_behavior_weight", 0.0)) > 0.0:
+                behavior_neighbors = build_legacy_behavior_neighbors(
+                    sequences=sequences,
+                    num_items=num_items,
+                    window_size=int(cfg.get("cr_soft_behavior_window", 5)),
+                    min_count=int(cfg.get("cr_soft_behavior_min_count", 2)),
+                    max_neighbors=int(cfg.get("cr_soft_max_behavior_neighbors", 50)),
+                )
+            soft_table, soft_weights, reliability = build_legacy_soft_semantic_table(
+                semantic_table=hard_table,
+                item_semantic_ids=item_codes,
+                num_items=num_items,
+                top_m=int(cfg.get("cr_soft_top_m", 4)),
+                min_overlap_slots=int(cfg.get("cr_soft_min_overlap_slots", 2)),
+                min_support=float(cfg.get("cr_soft_min_support", 0.05)),
+                support_eta=float(cfg.get("cr_soft_support_eta", 1.0)),
+                hard_token_prior=float(cfg.get("cr_soft_hard_token_prior", 1.0)),
+                reliability_floor=float(cfg.get("cr_soft_reliability_floor", 0.10)),
+                max_neighbors=int(cfg.get("cr_soft_max_neighbors", 50)),
+                lift_kappa=float(cfg.get("cr_soft_lift_kappa", 0.0)),
+                lift_clip=float(cfg.get("cr_soft_lift_clip", 5.0)),
+                lift_eps=float(cfg.get("cr_soft_lift_eps", 1e-6)),
+                decouple_reliability=bool(
+                    cfg.get("cr_soft_decouple_reliability", False)
+                ),
+                behavior_neighbors=behavior_neighbors,
+                behavior_neighbor_weight=float(
+                    cfg.get("cr_soft_behavior_weight", 0.0)
+                ),
+                base_neighbors=base_neighbors,
+            )
+        model = LegacyCRSIDRec(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            semantic_id_table=hard_table,
+            item_frequency=frequency,
+            soft_semantic_id_table=soft_table,
+            soft_semantic_id_weight=soft_weights,
+            semantic_reliability=reliability,
+            dim=int(cfg.get("dim", 128)),
+            max_len=int(cfg.get("max_len", 50)),
+            num_heads=int(cfg.get("num_heads", 2)),
+            num_layers=int(cfg.get("num_layers", 2)),
+            dropout=float(cfg.get("dropout", 0.2)),
+            tail_tau=float(cfg.get("cr_tail_tau", 20.0)),
+            residual_scale=float(cfg.get("cr_residual_scale", 1.0)),
+            alpha_mode=(
+                "semantic_hubness"
+                if variant == "crsid_semhub"
+                else "item_frequency"
+            ),
+            semantic_token_hubness=semantic_hubness,
+            hub_alpha_floor=float(cfg.get("cr_hub_alpha_floor", 0.05)),
+            hub_alpha_gamma=float(cfg.get("cr_hub_alpha_gamma", 1.0)),
+            disable_semantic_basis=bool(
+                cfg.get("cr_disable_semantic_basis", False)
+            ),
+            disable_shared_residual=bool(
+                cfg.get("cr_disable_shared_residual", False)
+            ),
+            disable_private_residual=bool(
+                cfg.get("cr_disable_private_residual", False)
+            ),
+            alpha_override=cfg.get("cr_alpha_override"),
+            alpha_frequency_transform=str(
+                cfg.get("cr_alpha_frequency_transform", "raw")
+            ),
+        )
+        model.load_state_dict(state["model"], strict=True)
+        model.to(device).eval()
+        cfg["dataset_dir"] = str(dataset_dir)
+        cfg["semantic_ids"] = str(semantic_ids)
+        cfg["evaluation_family"] = "legacy_qsdrec_crsid"
+        return model, sequences, frequency, num_items, cfg
+
+    # Direct HardSID baseline: deterministic hard SID semantics are added to
+    # an Item-ID collaborative embedding. This is the revised HardSID control,
+    # not an LCSoftCRSID checkpoint.
+    if "item_encoder.hard_sid_table" in state["model"]:
+        semantic_obj = read_json(semantic_ids)
+        hard_table, _, num_semantic_tokens = build_semantic_table(
+            semantic_obj, num_items
+        )
+        model = HardSIDFusion(
+            num_items=num_items,
+            num_semantic_tokens=num_semantic_tokens,
+            hard_sid_table=hard_table,
+            dim=int(cfg.get("dim", 128)),
+            max_len=int(cfg.get("max_len", 50)),
+            num_heads=int(cfg.get("num_heads", 2)),
+            num_layers=int(cfg.get("num_layers", 2)),
+            dropout=float(cfg.get("dropout", 0.2)),
+        )
+        model.load_state_dict(state["model"], strict=True)
+        model.to(device).eval()
+        cfg["dataset_dir"] = str(dataset_dir)
+        cfg["semantic_ids"] = str(semantic_ids)
+        cfg["evaluation_family"] = "hard_sid_direct_fusion"
         return model, sequences, frequency, num_items, cfg
 
     semantic_obj = read_json(semantic_ids)
@@ -213,7 +348,7 @@ def build_model(
 
 @torch.no_grad()
 def evaluate(
-    model: LCSoftCRSID | SASRecEncoder,
+    model: LCSoftCRSID | SASRecEncoder | LegacyCRSIDRec | HardSIDFusion,
     sequences: list[dict[str, Any]],
     frequency: torch.Tensor,
     num_items: int,
@@ -251,18 +386,40 @@ def evaluate(
                 model.item_encoder(all_items[start : start + candidate_chunk_size])
             )
         all_item_vectors = torch.cat(item_vector_chunks, dim=0)
+    elif isinstance(model, LegacyCRSIDRec):
+        all_item_vectors = None
+    elif isinstance(model, HardSIDFusion):
+        item_vector_chunks = []
+        for start in range(0, num_items, candidate_chunk_size):
+            item_vector_chunks.append(
+                model.item_encoder(
+                    all_items[start : start + candidate_chunk_size]
+                )["vectors"]
+            )
+        all_item_vectors = torch.cat(item_vector_chunks, dim=0)
     else:
         all_item_vectors = model.item_emb(all_items)
 
     for history, targets in loader:
         history = history.to(device)
         targets = targets.to(device)
-        if isinstance(model, LCSoftCRSID):
+        if isinstance(model, LegacyCRSIDRec):
+            score_chunks = []
+            for start in range(0, num_items, candidate_chunk_size):
+                candidates = all_items[start : start + candidate_chunk_size]
+                candidates = candidates.unsqueeze(0).expand(history.size(0), -1)
+                score_chunks.append(model(history, candidates)["score"])
+            scores = torch.cat(score_chunks, dim=1)
+        elif isinstance(model, HardSIDFusion):
+            user_vectors, _ = model.encode_sequence(history)
+            scores = user_vectors @ all_item_vectors.transpose(0, 1)
+        elif isinstance(model, LCSoftCRSID):
             history_vectors = model.item_encoder(history)
             user_vectors, _ = model.sequence_encoder(history, history_vectors)
+            scores = user_vectors @ all_item_vectors.transpose(0, 1)
         else:
             user_vectors, _ = model(history)
-        scores = user_vectors @ all_item_vectors.transpose(0, 1)
+            scores = user_vectors @ all_item_vectors.transpose(0, 1)
 
         seen = history.gt(0)
         if seen.any():
