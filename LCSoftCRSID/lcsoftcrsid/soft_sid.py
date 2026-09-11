@@ -16,6 +16,7 @@ class SoftSIDConfig:
     reliability_floor: float = 0.10
     max_neighbors: int = 50
     candidate_construction: str = "local_prior"
+    hard_token_prior: float = 1.0
 
 
 def build_semantic_table(
@@ -125,7 +126,9 @@ def build_soft_sid_table(
 
             # The original hard token remains a stable anchor while local
             # candidates repair overly rigid code assignments.
-            candidates[hard_token] = candidates.get(hard_token, 0.0) + denominator
+            candidates[hard_token] = candidates.get(hard_token, 0.0) + (
+                float(config.hard_token_prior) * denominator
+            )
             ranked = sorted(
                 (
                     (token, weight_count, max(weight_count, 1e-6) ** 2)

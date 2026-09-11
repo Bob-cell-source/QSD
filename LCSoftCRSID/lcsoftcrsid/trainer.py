@@ -98,6 +98,7 @@ def train(args: argparse.Namespace) -> None:
         min_support=args.soft_min_support,
         reliability_floor=args.soft_reliability_floor,
         max_neighbors=args.soft_max_neighbors,
+        hard_token_prior=args.soft_hard_token_prior,
         candidate_construction=(
             "uniform_topk"
             if args.candidate_weight_mode == "neighborhood_learned"
@@ -398,6 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--soft-min-support", type=float, default=0.05)
     parser.add_argument("--soft-reliability-floor", type=float, default=0.10)
     parser.add_argument("--soft-max-neighbors", type=int, default=50)
+    parser.add_argument("--soft-hard-token-prior", type=float, default=1.0)
     parser.add_argument(
         "--soft-neighbor-source",
         choices=["sid_overlap", "text_knn"],

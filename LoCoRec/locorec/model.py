@@ -352,6 +352,7 @@ class LoCoRec(nn.Module):
         num_heads: int = 2,
         num_layers: int = 2,
         dropout: float = 0.2,
+        embedding_dropout: float = 0.0,
         tail_tau: float = 20.0,
         residual_scale: float = 1.0,
         gate_correction_scale: float = 0.3,
@@ -379,9 +380,11 @@ class LoCoRec(nn.Module):
             gate_correction_scale=gate_correction_scale,
             gate_private_margin=gate_private_margin,
         )
+        self.embedding_dropout = nn.Dropout(embedding_dropout)
 
     def encode_sequence(self, sequence: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         output = self.item_encoder(sequence)
+        output["vectors"] = self.embedding_dropout(output["vectors"])
         return self.sequence_encoder(sequence, output["vectors"]), output
 
     def score_candidates(
